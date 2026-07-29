@@ -20,6 +20,19 @@ CONF_THRESH = 0.5
 
 WINDOW_NAME = "YOLO Seg - GPU"
 
+# ===== 顶点显示配置 =====
+VERTEX_RADIUS = 4          # 顶点圆点半径
+VERTEX_COLOR = (0, 0, 255)  # 顶点颜色 (红色)
+VERTEX_THICKNESS = -1       # 填充圆点
+EDGE_COLOR = (0, 255, 255)  # 多边形边颜色 (黄色)
+EDGE_THICKNESS = 2
+APPROX_EPSILON = 0.08       # 轮廓近似精度（越小顶点越多，越大越简化）
+
+# ===== 几何中心点配置 =====
+CENTROID_RADIUS = 3        # 中心点半径
+CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
+CENTROID_THICKNESS = -1     # 填充圆点
+
 
 def build_gst_pipeline(cam_idx, width, height, fps):
     return (
@@ -30,6 +43,74 @@ def build_gst_pipeline(cam_idx, width, height, fps):
         f"video/x-raw,format=BGR ! "
         f"appsink drop=1 max-buffers=2"
     )
+
+
+def draw_convex_polygon_vertices(image, masks_data, class_ids=None):
+    """
+    从 YOLO mask 数据中提取凸多边形顶点并绘制到图像上。
+
+    Args:
+        image: OpenCV BGR 图像 (会被原地修改)
+        masks_data: YOLO results[0].masks 对象
+        class_ids: 每个 mask 的类别 ID 列表（可选，用于按类别着色）
+    """
+    if masks_data is None:
+        return
+
+    for _i, mask_tensor in enumerate(masks_data.data):
+        # mask_tensor: (H, W) 的 float tensor，值 0~1
+        mask = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+
+        # 调整 mask 尺寸以匹配图像
+        if mask.shape != image.shape[:2]:
+            mask = cv2.resize(mask, (image.shape[1], image.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+
+        # 二值化
+        _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+        # 查找轮廓
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        # 取最大轮廓
+        cnt = max(contours, key=cv2.contourArea)
+
+        # 多边形近似
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
+
+        # 凸包（确保凸多边形）
+        hull = cv2.convexHull(approx)
+
+        # 顶点数过少则跳过
+        if len(hull) < 3:
+            continue
+
+        # --- 绘制多边形边 ---
+        for j in range(len(hull)):
+            pt1 = tuple(hull[j][0])
+            pt2 = tuple(hull[(j + 1) % len(hull)][0])
+            cv2.line(image, pt1, pt2, EDGE_COLOR, EDGE_THICKNESS)
+
+        # --- 绘制顶点 ---
+        for pt in hull:
+            cv2.circle(image, tuple(pt[0]), VERTEX_RADIUS, VERTEX_COLOR, VERTEX_THICKNESS)
+
+        # --- 顶点序号（可选） ---
+        for idx, pt in enumerate(hull):
+            cv2.putText(image, str(idx + 1),
+                        (pt[0][0] + 8, pt[0][1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # --- 几何中心点 ---
+        M = cv2.moments(cnt)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            cv2.circle(image, (cx, cy), CENTROID_RADIUS, CENTROID_COLOR, CENTROID_THICKNESS)
 
 
 def main():
@@ -95,6 +176,9 @@ def main():
         )
 
         display = last_annotated
+
+        # --- 绘制凸多边形顶点 ---
+        draw_convex_polygon_vertices(display, results[0].masks)
 
         # --- FPS ---
         now = time.time()
