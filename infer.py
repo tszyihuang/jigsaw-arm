@@ -10,6 +10,7 @@ from datetime import datetime
 import numpy as np
 import torch
 from ultralytics import YOLO
+from reassemble import masks_from_yolo, reassemble
 
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
@@ -26,7 +27,7 @@ VERTEX_COLOR = (0, 0, 255)  # 顶点颜色 (红色)
 VERTEX_THICKNESS = -1       # 填充圆点
 EDGE_COLOR = (0, 255, 255)  # 多边形边颜色 (黄色)
 EDGE_THICKNESS = 2
-APPROX_EPSILON = 0.08       # 轮廓近似精度（越小顶点越多，越大越简化）
+APPROX_EPSILON = 0.02       # 轮廓近似精度（越小顶点越多，越大越简化）
 
 # ===== 几何中心点配置 =====
 CENTROID_RADIUS = 3        # 中心点半径
@@ -141,7 +142,7 @@ def main():
     print(f"摄像头: /dev/video{dev}  {actual_w}x{actual_h}")
     screenshots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
     os.makedirs(screenshots_dir, exist_ok=True)
-    print("按 q 退出 | 空格/s 截图 | +/- 调整置信度\n")
+    print("按 q 退出 | 空格/s 截图 | r 拼接 | +/- 调整置信度\n")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, WIDTH, HEIGHT)
@@ -219,6 +220,17 @@ def main():
         elif key == ord('-'):
             conf_thresh = max(0.1, conf_thresh - 0.05)
             print(f"Conf: {conf_thresh:.2f}")
+        elif key == ord('r'):
+            try:
+                masks = masks_from_yolo(results)
+                if len(masks) < 4:
+                    print(f"需要至少 4 个碎片，当前仅检测到 {len(masks)} 个")
+                else:
+                    canvas, _ = reassemble(masks)
+                    cv2.imshow("Reassembled", canvas)
+                    print("拼接完成 — 窗口 'Reassembled'")
+            except Exception as e:
+                print(f"拼接失败: {e}")
 
     cap.release()
     cv2.destroyAllWindows()
