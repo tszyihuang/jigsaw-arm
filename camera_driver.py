@@ -4,6 +4,8 @@
 import cv2
 import sys
 import time
+import os
+from datetime import datetime
 
 CAMERA_INDEX = 0          # /dev/video0
 WIDTH, HEIGHT = 1280, 720
@@ -41,7 +43,9 @@ def main():
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"摄像头已打开: /dev/video{dev}  {actual_w}x{actual_h} @ 目标 {FPS}fps")
-    print("按 'q' 退出, 按 's' 截图保存为 snapshot.jpg")
+    screenshot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
+    os.makedirs(screenshot_dir, exist_ok=True)
+    print("按 'q' 退出, 按 空格 或 's' 截图保存")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
@@ -79,9 +83,11 @@ def main():
         if key == ord('q'):
             print("退出")
             break
-        elif key == ord('s'):
-            cv2.imwrite("snapshot.jpg", frame)
-            print("已保存 snapshot.jpg")
+        elif key == ord('s') or key == 32:  # 's' 或 空格键
+            filename = datetime.now().strftime("snapshot_%Y%m%d_%H%M%S_%f") + ".jpg"
+            filepath = os.path.join(screenshot_dir, filename)
+            cv2.imwrite(filepath, frame)
+            print(f"已保存 {filepath}")
 
     cap.release()
     cv2.destroyAllWindows()
