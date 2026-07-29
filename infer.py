@@ -7,6 +7,7 @@ import time
 import os
 from datetime import datetime
 
+import numpy as np
 import torch
 from ultralytics import YOLO
 
@@ -16,6 +17,7 @@ CAMERA_INDEX = 0
 WIDTH, HEIGHT = 1280, 720
 FPS = 60
 CONF_THRESH = 0.5
+VERTEX_EPSILON = 0.01  # 多边形顶点逼近精度（占周长比例，越小越精细）
 
 WINDOW_NAME = "YOLO Seg - GPU"
 
@@ -62,6 +64,7 @@ def main():
     print("按 q 退出 | 空格/s 截图 | +/- 调整置信度\n")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, WIDTH, HEIGHT)
 
     prev_time = time.time()
     fps_smoothed = 0.0
@@ -84,13 +87,46 @@ def main():
 
         clean = frame.copy()
 
-        # --- 原始分辨率推理 ---
-        results = model(frame, verbose=False, conf=conf_thresh)
+        # --- 原始分辨率推理（FP32 全精度） ---
+        results = model(frame, verbose=False, conf=conf_thresh, half=False)
 
+        # --- 绘制 mask（不画框） ---
         last_annotated = results[0].plot(
-            masks=True, boxes=True, labels=True,
+            masks=True, boxes=False, labels=True,
             line_width=2, font_size=1.2,
         )
+
+        # --- 从 mask 提取凸多边形顶点 ---
+        if results[0].masks is not None and results[0].masks.xy is not None:
+            for poly in results[0].masks.xy:
+                if len(poly) < 3:
+                    continue
+                # poly: (N, 2) → (N, 1, 2) for OpenCV
+                pts = poly.reshape(-1, 1, 2).astype(np.int32)
+
+                # 凸包 → 确保凸性
+                hull = cv2.convexHull(pts)
+                if hull is None or len(hull) < 3:
+                    continue
+
+                # 多边形逼近 → 得到顶点
+                epsilon = VERTEX_EPSILON * cv2.arcLength(hull, True)
+                approx = cv2.approxPolyDP(hull, epsilon, True)
+
+                # 画多边形边（黄色）
+                cv2.polylines(last_annotated, [approx], True, (0, 255, 255), 2)
+
+                # 画顶点 + 坐标
+                for pt in approx:
+                    x, y = pt[0]
+                    # 黄色实心圆 + 黑色描边
+                    cv2.circle(last_annotated, (x, y), 6, (0, 255, 255), -1)
+                    cv2.circle(last_annotated, (x, y), 7, (0, 0, 0), 1)
+                    # 坐标文字（白色 + 黑色阴影）
+                    cv2.putText(last_annotated, f"({x},{y})", (x + 9, y - 9),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+                    cv2.putText(last_annotated, f"({x},{y})", (x + 10, y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         display = last_annotated
 

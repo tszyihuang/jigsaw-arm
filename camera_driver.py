@@ -48,6 +48,7 @@ def main():
     print("按 'q' 退出, 按 空格 或 's' 截图保存")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, WIDTH, HEIGHT)
 
     # FPS 平滑统计（滑动平均）
     prev_time = time.time()
