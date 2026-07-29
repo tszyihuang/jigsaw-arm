@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YOLOv8 实时实例分割 — GPU 推理 + 低分辨率输入"""
+"""YOLOv8 实时实例分割 — GPU 推理"""
 
 import cv2
 import sys
@@ -15,7 +15,6 @@ MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.p
 CAMERA_INDEX = 0
 WIDTH, HEIGHT = 1280, 720
 FPS = 60
-INFER_SIZE = 320        # 推理分辨率（低 → 快，高 → 准）
 CONF_THRESH = 0.5
 
 WINDOW_NAME = "YOLO Seg - GPU"
@@ -58,7 +57,6 @@ def main():
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"摄像头: /dev/video{dev}  {actual_w}x{actual_h}")
-    print(f"推理尺寸: {INFER_SIZE}x{INFER_SIZE}")
     screenshots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
     os.makedirs(screenshots_dir, exist_ok=True)
     print("按 q 退出 | 空格/s 截图 | +/- 调整置信度\n")
@@ -72,10 +70,10 @@ def main():
 
     # 预热：跑一次推理让 CUDA JIT 编译完
     print("预热 CUDA...")
-    model(cv2.resize(cv2.imread(os.path.join(
+    model(cv2.imread(os.path.join(
         "/home/jetson/Desktop/vision/dataset/images/val",
         sorted(os.listdir("/home/jetson/Desktop/vision/dataset/images/val"))[0]
-    )), (INFER_SIZE, INFER_SIZE)), verbose=False, imgsz=INFER_SIZE)
+    )), verbose=False)
     print("预热完成，开始实时推理\n")
 
     while True:
@@ -86,16 +84,13 @@ def main():
 
         clean = frame.copy()
 
-        # --- 缩小分辨率做推理 ---
-        small = cv2.resize(frame, (INFER_SIZE, INFER_SIZE))
-        results = model(small, verbose=False, conf=conf_thresh, imgsz=INFER_SIZE)
+        # --- 原始分辨率推理 ---
+        results = model(frame, verbose=False, conf=conf_thresh)
 
-        # 模型推理结果是在 small 坐标系上，plot 到 small 上再 resize 回来
-        annotated_small = results[0].plot(
+        last_annotated = results[0].plot(
             masks=True, boxes=True, labels=True,
             line_width=2, font_size=1.2,
         )
-        last_annotated = cv2.resize(annotated_small, (actual_w, actual_h))
 
         display = last_annotated
 
