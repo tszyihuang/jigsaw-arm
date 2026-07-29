@@ -14,10 +14,9 @@ from ultralytics import YOLO
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
 CAMERA_INDEX = 0
-WIDTH, HEIGHT = 1280, 720
+WIDTH, HEIGHT = 640, 480
 FPS = 60
 CONF_THRESH = 0.5
-VERTEX_EPSILON = 0.01  # 多边形顶点逼近精度（占周长比例，越小越精细）
 
 WINDOW_NAME = "YOLO Seg - GPU"
 
@@ -68,7 +67,6 @@ def main():
 
     prev_time = time.time()
     fps_smoothed = 0.0
-    last_annotated = None
     conf_thresh = CONF_THRESH
 
     # 预热：跑一次推理让 CUDA JIT 编译完
@@ -76,7 +74,7 @@ def main():
     model(cv2.imread(os.path.join(
         "/home/jetson/Desktop/vision/dataset/images/val",
         sorted(os.listdir("/home/jetson/Desktop/vision/dataset/images/val"))[0]
-    )), verbose=False)
+    )), verbose=False, half=True)
     print("预热完成，开始实时推理\n")
 
     while True:
@@ -87,46 +85,14 @@ def main():
 
         clean = frame.copy()
 
-        # --- 原始分辨率推理（FP32 全精度） ---
-        results = model(frame, verbose=False, conf=conf_thresh, half=False)
+        # --- 半精度推理（FP16，省显存） ---
+        results = model(frame, verbose=False, conf=conf_thresh, half=True)
 
         # --- 绘制 mask（不画框） ---
         last_annotated = results[0].plot(
             masks=True, boxes=False, labels=True,
             line_width=2, font_size=1.2,
         )
-
-        # --- 从 mask 提取凸多边形顶点 ---
-        if results[0].masks is not None and results[0].masks.xy is not None:
-            for poly in results[0].masks.xy:
-                if len(poly) < 3:
-                    continue
-                # poly: (N, 2) → (N, 1, 2) for OpenCV
-                pts = poly.reshape(-1, 1, 2).astype(np.int32)
-
-                # 凸包 → 确保凸性
-                hull = cv2.convexHull(pts)
-                if hull is None or len(hull) < 3:
-                    continue
-
-                # 多边形逼近 → 得到顶点
-                epsilon = VERTEX_EPSILON * cv2.arcLength(hull, True)
-                approx = cv2.approxPolyDP(hull, epsilon, True)
-
-                # 画多边形边（黄色）
-                cv2.polylines(last_annotated, [approx], True, (0, 255, 255), 2)
-
-                # 画顶点 + 坐标
-                for pt in approx:
-                    x, y = pt[0]
-                    # 黄色实心圆 + 黑色描边
-                    cv2.circle(last_annotated, (x, y), 6, (0, 255, 255), -1)
-                    cv2.circle(last_annotated, (x, y), 7, (0, 0, 0), 1)
-                    # 坐标文字（白色 + 黑色阴影）
-                    cv2.putText(last_annotated, f"({x},{y})", (x + 9, y - 9),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-                    cv2.putText(last_annotated, f"({x},{y})", (x + 10, y - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         display = last_annotated
 
