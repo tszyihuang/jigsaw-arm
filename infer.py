@@ -139,14 +139,13 @@ def main():
     print(f"摄像头: /dev/video{dev}  {actual_w}x{actual_h}")
     screenshots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
     os.makedirs(screenshots_dir, exist_ok=True)
-    print("按 q 退出 | 空格/s 截图 | r 拼接 | +/- 调整置信度\n")
+    print("按 q 退出 | 空格/s 截图 | r 拼接\n")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, WIDTH, HEIGHT)
 
     prev_time = time.time()
     fps_smoothed = 0.0
-    conf_thresh = CONF_THRESH
 
     # 预热：跑一次推理让 CUDA JIT 编译完
     print("预热 CUDA...")
@@ -165,7 +164,7 @@ def main():
         clean = frame.copy()
 
         # --- 半精度推理（FP16，省显存） ---
-        results = model(frame, verbose=False, conf=conf_thresh, half=True)
+        results = model(frame, verbose=False, conf=CONF_THRESH, half=True)
 
         # --- 绘制 mask（不画框） ---
         last_annotated = results[0].plot(
@@ -187,7 +186,6 @@ def main():
 
         # --- HUD 顶栏 ---
         fps_text = f"FPS: {fps_smoothed:.1f}"
-        conf_text = f"Conf: {conf_thresh:.2f}"
         _, th = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
         bar_h = th + 16
 
@@ -196,8 +194,6 @@ def main():
         cv2.addWeighted(overlay, 0.4, display, 0.6, 0, display)
         cv2.putText(display, fps_text, (10, th + 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(display, conf_text, (140, th + 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         cv2.imshow(WINDOW_NAME, display)
 
@@ -211,12 +207,6 @@ def main():
             filepath = os.path.join(screenshots_dir, filename)
             cv2.imwrite(filepath, clean)
             print(f"已保存: {filepath}")
-        elif key == ord('+') or key == ord('='):
-            conf_thresh = min(1.0, conf_thresh + 0.05)
-            print(f"Conf: {conf_thresh:.2f}")
-        elif key == ord('-'):
-            conf_thresh = max(0.1, conf_thresh - 0.05)
-            print(f"Conf: {conf_thresh:.2f}")
         elif key == ord('r'):
             try:
                 masks = masks_from_yolo(results)
