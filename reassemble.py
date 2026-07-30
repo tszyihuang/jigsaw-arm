@@ -132,7 +132,7 @@ def _check_quadrilateral_angles(vertices, angle_tolerance=20.0):
     return True
 
 
-def merge_collinear_edges(hull, angle_threshold=175.0):
+def merge_collinear_edges(hull, angle_threshold=170.0):
     """
     融并冗余顶点：遍历每个顶点，计算其所接两条邻边的夹角。
     - 夹角 >= angle_threshold → 两条边几乎共线（接近 180°），融并该顶点
@@ -228,7 +228,7 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
     merged = merged.reshape(-1, 2)
 
     # ★ 步骤 4: 遍历顶点，判断所接两条邻边的夹角，>= 175° 则融并
-    merged = merge_collinear_edges(merged, angle_threshold=178.0)
+    merged = merge_collinear_edges(merged, angle_threshold=175.0)
 
     return merged  # (N, 2) float32
 
@@ -303,7 +303,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
             max_len_v = max(m_len, lb)
 
             # 长度差超过 10% → 跳过，不计算仿射
-            if max_len_v > 0 and diff / max_len_v > 0.10:
+            if max_len_v > 0 and diff / max_len_v > 0.20:
                 continue
 
             M = align_matrix(poly_edges[ib], (mp1, mp2, m_len))
@@ -377,7 +377,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     return best_result
 
 
-def reassemble(masks, canvas_size=(640, 480), area_threshold=0.96, target_vertices=4):
+def reassemble(masks, canvas_size=(640, 480), area_threshold=0.95, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
 
