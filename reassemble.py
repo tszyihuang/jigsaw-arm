@@ -97,8 +97,12 @@ def transform(M, pts):
 #  多边形融合
 # ============================================================
 
-def merge_collinear_edges(hull, angle_tol=3.0):
-    """移除共线相邻边之间的冗余顶点。"""
+def merge_collinear_edges(hull, angle_threshold=175.0):
+    """
+    融并冗余顶点：遍历每个顶点，计算其所接两条邻边的夹角。
+    - 夹角 >= angle_threshold → 两条边几乎共线（接近 180°），融并该顶点
+    - 夹角 <  angle_threshold → 形成明显拐角，保留该顶点
+    """
     if len(hull) <= 3:
         return hull
 
@@ -110,16 +114,23 @@ def merge_collinear_edges(hull, angle_tol=3.0):
         curr = hull[i]
         nxt = hull[(i + 1) % n]
 
+        # 进入 curr 的边方向（指向 curr）
         v1 = curr - prev
+        # 离开 curr 的边方向（背离 curr）
         v2 = nxt - curr
         n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
         if n1 < 1.0 or n2 < 1.0:
             drop[i] = True
             continue
 
+        # v1 指向 curr, v2 背离 curr，直行时二者同向
+        # → angle_between ≈ 0° → corner_angle ≈ 180°（平直）
         cos_a = np.dot(v1, v2) / (n1 * n2)
-        angle = np.degrees(np.arccos(np.clip(abs(cos_a), 0, 1)))
-        if angle < angle_tol:
+        cos_a = np.clip(cos_a, -1.0, 1.0)
+        angle_between = np.degrees(np.arccos(cos_a))  # 0°=同向, 180°=反向
+        corner_angle = 180.0 - angle_between           # 180°=平直, 0°=急弯
+
+        if corner_angle >= angle_threshold:
             drop[i] = True
 
     kept = hull[~np.array(drop)]
@@ -128,10 +139,21 @@ def merge_collinear_edges(hull, angle_tol=3.0):
 
 def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
     """
-    融合两个对齐后的多边形。
+    融合两个对齐后的多边形（保留凹形，不走凸包）。
 
-    端点交叉配对（方向相反）→ 取中点 → 排除贴合边端点 →
-    加融合顶点 → 凸包 → 简化 → 去共线。
+    交叉配对：
+      fixed[idx_f1] ≈ moving[idx_m2]  →  接合点 v1
+      fixed[idx_f2] ≈ moving[idx_m1]  →  接合点 v2
+
+    融合后按顶点顺序绕行：
+      v1 → moving[idx_m2+1] → ... → moving[idx_m1-1] → v2
+         → fixed[idx_f2+1] → ... → fixed[idx_f1-1] → 回到 v1
+
+    步骤：
+      1. 取中点融合成 v1, v2
+      2. 按顺序串联顶点（排除贴合边端点）
+      3. 简化（approxPolyDP）
+      4. 角度判断：邻边夹角 >= 175° → 融并该顶点
     """
     fixed_f = _to_float32(fixed)
     moving_f = _to_float32(moving_aligned)
@@ -142,25 +164,36 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
     idx_m1 = ib_moving
     idx_m2 = (ib_moving + 1) % n_m
 
-    # 交叉配对取中点
+    # ★ 步骤 1: 无论什么情况，先取中点融合成一个顶点
     v1 = (fixed_f[idx_f1] + moving_f[idx_m2]) / 2.0
     v2 = (fixed_f[idx_f2] + moving_f[idx_m1]) / 2.0
 
-    pts = [v1, v2]
-    for i in range(n_f):
-        if i != idx_f1 and i != idx_f2:
-            pts.append(fixed_f[i])
-    for i in range(n_m):
-        if i != idx_m1 and i != idx_m2:
-            pts.append(moving_f[i])
+    # ★ 步骤 2: 按顶点顺序绕行，排除贴合边的四个端点
+    ordered_pts = [v1]
 
-    all_pts = np.array(pts, dtype=np.float32)
+    # 从 moving 的 idx_m2+1 走到 idx_m1-1（沿 moving 多边形方向，跳过贴合边）
+    i = (idx_m2 + 1) % n_m
+    while i != idx_m1:
+        ordered_pts.append(moving_f[i])
+        i = (i + 1) % n_m
 
-    merged = cv2.convexHull(all_pts).reshape(-1, 2)
+    ordered_pts.append(v2)
+
+    # 从 fixed 的 idx_f2+1 走到 idx_f1-1（沿 fixed 多边形方向，跳过贴合边）
+    i = (idx_f2 + 1) % n_f
+    while i != idx_f1:
+        ordered_pts.append(fixed_f[i])
+        i = (i + 1) % n_f
+
+    merged = np.array(ordered_pts, dtype=np.float32)
+
+    # ★ 步骤 3: 简化轮廓（Douglas-Peucker，保留凹形）
     peri = cv2.arcLength(merged.astype(np.float32), True)
     merged = cv2.approxPolyDP(merged.astype(np.float32), 0.02 * peri, True)
     merged = merged.reshape(-1, 2)
-    merged = merge_collinear_edges(merged)
+
+    # ★ 步骤 4: 遍历顶点，判断所接两条邻边的夹角，>= 175° 则融并
+    merged = merge_collinear_edges(merged, angle_threshold=175.0)
 
     return merged  # (N, 2) float32
 
