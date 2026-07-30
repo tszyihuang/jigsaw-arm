@@ -27,7 +27,7 @@ VERTEX_COLOR = (0, 0, 255)  # 顶点颜色 (红色)
 VERTEX_THICKNESS = -1       # 填充圆点
 EDGE_COLOR = (0, 255, 255)  # 多边形边颜色 (黄色)
 EDGE_THICKNESS = 2
-APPROX_EPSILON = 0.02       # 轮廓近似精度（越小顶点越多，越大越简化）
+APPROX_EPSILON = 0.03       # 轮廓近似精度（越小顶点越多，越大越简化）
 
 # ===== 几何中心点配置 =====
 CENTROID_RADIUS = 3        # 中心点半径
