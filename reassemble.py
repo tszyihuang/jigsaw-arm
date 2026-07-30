@@ -202,15 +202,15 @@ def masks_from_yolo(results, num_fragments=4):
 
 def reassemble(masks, canvas_size=(640, 480)):
     """
-    碎片拼接主逻辑（迭代组合）。
+    碎片拼接主逻辑（迭代组合 + 顶点融合）。
 
     1. 随机挑选一个碎片固定
-    2. 逐个取剩余碎片，将其匹配到"已组合体"的所有边中最接近的那条
-    3. 对齐后加入组合体，下一轮以更大的组合体为基础继续匹配
-    4. 显示所有对齐后的碎片
+    2. 逐个取剩余碎片，与当前融合体的所有边匹配，找长度最接近的
+    3. 仿射对齐 → 顶点融合 → 以更大的融合体继续下一轮
+    4. 显示各碎片位置和最终融合轮廓
 
     Returns:
-        (canvas, aligned_fragments): 可视化图像和对齐后的碎片列表
+        (canvas, [merged_poly]): 可视化图像和融合后的多边形
     """
     if len(masks) < 2:
         raise ValueError(f"需要至少 2 个碎片，当前仅有 {len(masks)} 个")
@@ -220,56 +220,49 @@ def reassemble(masks, canvas_size=(640, 480)):
 
     # ---- 1. 随机挑选一个固定 ----
     fixed_idx = random.randrange(n)
-    aligned_frags = [(fixed_idx, polygons[fixed_idx].copy())]  # (原始编号, 顶点)
+    merged_poly = polygons[fixed_idx].copy()  # 融合体（不断增长）
+    display_frags = [(fixed_idx, polygons[fixed_idx].copy())]  # 用于绘制
 
     remaining = [(i, polygons[i]) for i in range(n) if i != fixed_idx]
 
-    print(f"固定碎片: {fixed_idx + 1}  ({len(polygons[fixed_idx])} 顶点)")
+    print(f"固定碎片: {fixed_idx + 1}  ({len(merged_poly)} 顶点)")
 
-    # ---- 2. 逐个对齐剩余碎片（每次基于整个已组合体） ----
+    # ---- 2. 逐个匹配 + 对齐 + 融合 ----
     for step, (orig_idx, poly) in enumerate(remaining):
+        merged_edges = polygon_edges(merged_poly)
         poly_edges = polygon_edges(poly)
 
-        # 收集已组合体中所有碎片的所有边
-        # group_edges: [(p1, p2, length, local_idx, frag_order), ...]
-        group_edges = []
-        for frag_order, (fid, frag) in enumerate(aligned_frags):
-            for e in polygon_edges(frag):
-                group_edges.append((*e, frag_order, fid))
-
-        # 在组合体的所有边中找与当前碎片最接近的边
+        # 在融合体所有边中找长度最接近的
+        best_ia, best_ib = 0, 0
         best_diff = float('inf')
-        best_ge = None   # 组合体中最佳边
-        best_ib = 0      # 当前碎片中最佳边索引
-
-        for ge in group_edges:
-            ge_p1, ge_p2, ge_len, ge_local_idx, ge_frag_order, ge_fid = ge
+        for ia, (_, _, la, _) in enumerate(merged_edges):
             for ib, (_, _, lb, _) in enumerate(poly_edges):
-                diff = abs(ge_len - lb)
+                diff = abs(la - lb)
                 if diff < best_diff:
                     best_diff = diff
-                    best_ge = ge
-                    best_ib = ib
+                    best_ia, best_ib = ia, ib
 
-        # 解包最佳匹配
-        _, _, ge_len, ge_local_idx, ge_frag_order, ge_fid = best_ge
-        ib = best_ib
-        lb = poly_edges[ib][2]
+        ia, ib = best_ia, best_ib
+        la, lb = merged_edges[ia][2], poly_edges[ib][2]
 
-        print(f"  第 {step+1} 次对齐: "
-              f"组合体(碎片{ge_fid+1})边[{ge_local_idx}]={ge_len:.1f}px  "
+        print(f"  第 {step+1} 次拼接: "
+              f"融合体边[{ia}]={la:.1f}px  "
               f"←→ 碎片{orig_idx+1}边[{ib}]={lb:.1f}px  (差 {best_diff:.1f}px)")
 
-        # 仿射对齐：碎片边 → 组合体边
-        M = align_matrix(poly_edges[ib], (best_ge[0], best_ge[1], best_ge[2]))
+        # 仿射对齐
+        M = align_matrix(poly_edges[ib], merged_edges[ia])
         poly_aligned = transform(M, poly)
-        aligned_frags.append((orig_idx, poly_aligned))
+        display_frags.append((orig_idx, poly_aligned))
 
-    print(f"共对齐 {len(aligned_frags) - 1} 个碎片")
+        # 顶点融合
+        merged_poly = merge_polygons(merged_poly, poly_aligned, ia, ib)
+        print(f"    → 融合后 {len(merged_poly)} 顶点")
+
+    print(f"\n最终结果: {len(merged_poly)} 顶点")
 
     # ---- 3. 绘制 ----
-    canvas = draw_result([f for _, f in aligned_frags])
-    return canvas, [f for _, f in aligned_frags]
+    canvas = draw_result(display_frags, merged_poly)
+    return canvas, [merged_poly]
 
 
 # ============================================================
@@ -285,14 +278,18 @@ FRAGMENT_COLORS = [
 ]
 
 
-def draw_result(fragments):
+def draw_result(fragments, merged=None):
     """
     绘制拼接示意图。
 
     - 彩色半透明填充 + 轮廓 = 各碎片（对齐后的位置）
-    - 第一个碎片（固定碎片）用黄色粗轮廓突出
+    - 白色粗轮廓 = 融合后的最终多边形（如果提供）
+    - #1 #2 ... 标注选择顺序
     """
-    all_pts = np.vstack(fragments).astype(np.int32)
+    all_pts_list = [f for _, f in fragments]
+    if merged is not None:
+        all_pts_list.append(merged)
+    all_pts = np.vstack(all_pts_list).astype(np.int32)
     x_min, y_min = all_pts.min(axis=0)
     x_max, y_max = all_pts.max(axis=0)
 
@@ -303,7 +300,8 @@ def draw_result(fragments):
 
     canvas = np.full((h, w, 3), 30, dtype=np.uint8)
 
-    for i, frag in enumerate(fragments):
+    # --- 各碎片（半透明） ---
+    for i, (orig_idx, frag) in enumerate(fragments):
         color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
         thickness = 3 if i == 0 else 2   # 第1个碎片（固定）用粗轮廓
 
@@ -322,9 +320,13 @@ def draw_result(fragments):
         if M['m00'] > 0:
             cx = int(M['m10'] / M['m00'])
             cy = int(M['m01'] / M['m00'])
-            label = f"#{i + 1}"
-            cv2.putText(canvas, label, (cx - 15, cy + 5),
+            cv2.putText(canvas, f"#{i + 1}", (cx - 15, cy + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    # --- 融合后多边形（白色粗轮廓） ---
+    if merged is not None:
+        merged_s = (merged + offset).astype(np.int32)
+        cv2.polylines(canvas, [merged_s], True, (255, 255, 255), 3)
 
     return canvas
 
