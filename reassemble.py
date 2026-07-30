@@ -316,12 +316,6 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
             global_best[0] = nv
         return (merged_poly.copy(), [(idx, f.copy()) for idx, f in display_frags])
 
-    # ---- 跨 combo 剪枝：当前顶点数已不优于全局最优，放弃该分支 ----
-    if global_best is not None and len(merged_poly) >= global_best[0]:
-        # 注：添加碎片理论上最多减少 2 顶点（融并两条边 → 各减 2 端点 + 2 投影点），
-        # 但非完美匹配时顶点数几乎只增不减，因此以 >= 为阈值做启发式剪枝。
-        return None
-
     orig_idx = remaining_order[0]
     rest = remaining_order[1:]
     poly = polygons[orig_idx]
@@ -410,7 +404,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     return best_result
 
 
-def reassemble(masks, area_threshold=0.95, target_vertices=4):
+def reassemble(masks, area_threshold=0.8, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
 
