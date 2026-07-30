@@ -46,9 +46,9 @@ def build_gst_pipeline(cam_idx, width, height, fps):
     )
 
 
-def draw_convex_polygon_vertices(image, masks_data, class_ids=None):
+def draw_contour_polygon_vertices(image, masks_data, class_ids=None):
     """
-    从 YOLO mask 数据中提取凸多边形顶点并绘制到图像上。
+    从 YOLO mask 数据中提取多边形顶点（支持凹多边形）并绘制到图像上。
 
     Args:
         image: OpenCV BGR 图像 (会被原地修改)
@@ -79,29 +79,26 @@ def draw_convex_polygon_vertices(image, masks_data, class_ids=None):
         # 取最大轮廓
         cnt = max(contours, key=cv2.contourArea)
 
-        # 多边形近似
+        # 多边形近似（保留凹形边界）
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
 
-        # 凸包（确保凸多边形）
-        hull = cv2.convexHull(approx)
-
         # 顶点数过少则跳过
-        if len(hull) < 3:
+        if len(approx) < 3:
             continue
 
         # --- 绘制多边形边 ---
-        for j in range(len(hull)):
-            pt1 = tuple(hull[j][0])
-            pt2 = tuple(hull[(j + 1) % len(hull)][0])
+        for j in range(len(approx)):
+            pt1 = tuple(approx[j][0])
+            pt2 = tuple(approx[(j + 1) % len(approx)][0])
             cv2.line(image, pt1, pt2, EDGE_COLOR, EDGE_THICKNESS)
 
         # --- 绘制顶点 ---
-        for pt in hull:
+        for pt in approx:
             cv2.circle(image, tuple(pt[0]), VERTEX_RADIUS, VERTEX_COLOR, VERTEX_THICKNESS)
 
         # --- 顶点序号（可选） ---
-        for idx, pt in enumerate(hull):
+        for idx, pt in enumerate(approx):
             cv2.putText(image, str(idx + 1),
                         (pt[0][0] + 8, pt[0][1] - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -178,8 +175,8 @@ def main():
 
         display = last_annotated
 
-        # --- 绘制凸多边形顶点 ---
-        draw_convex_polygon_vertices(display, results[0].masks)
+        # --- 绘制多边形顶点（支持凹形） ---
+        draw_contour_polygon_vertices(display, results[0].masks)
 
         # --- FPS ---
         now = time.time()
