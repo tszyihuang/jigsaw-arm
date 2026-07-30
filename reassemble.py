@@ -305,7 +305,7 @@ def draw_result(fragments):
 
     for i, frag in enumerate(fragments):
         color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
-        thickness = 3 if i == 0 else 2   # 固定碎片用粗轮廓
+        thickness = 3 if i == 0 else 2   # 第1个碎片（固定）用粗轮廓
 
         frag_s = (frag + offset).astype(np.int32)
 
@@ -316,6 +316,15 @@ def draw_result(fragments):
 
         # 轮廓
         cv2.polylines(canvas, [frag_s], True, color, thickness)
+
+        # 选择顺序标注（几何中心）
+        M = cv2.moments(frag_s.astype(np.float32))
+        if M['m00'] > 0:
+            cx = int(M['m10'] / M['m00'])
+            cy = int(M['m01'] / M['m00'])
+            label = f"#{i + 1}"
+            cv2.putText(canvas, label, (cx - 15, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     return canvas
 
