@@ -220,8 +220,8 @@ def main():
         elif key == ord('r'):
             try:
                 masks = masks_from_yolo(results)
-                if len(masks) < 4:
-                    print(f"需要至少 4 个碎片，当前仅检测到 {len(masks)} 个")
+                if len(masks) < 2:
+                    print(f"需要至少 2 个碎片，当前仅检测到 {len(masks)} 个")
                 else:
                     canvas, _ = reassemble(masks)
                     cv2.imshow("Reassembled", canvas)
