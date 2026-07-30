@@ -201,7 +201,7 @@ def masks_from_yolo(results, num_fragments=4):
 #  拼接核心
 # ============================================================
 
-def reassemble(masks, canvas_size=(640, 480), area_threshold=0.98):
+def reassemble(masks, canvas_size=(640, 480), area_threshold=0.96):
     """
     碎片拼接主逻辑（迭代组合 + 顶点融合 + 面积校验）。
 
