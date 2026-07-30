@@ -12,8 +12,8 @@
 
 import numpy as np
 import cv2
-import random
 import itertools
+import time
 
 
 # ============================================================
@@ -24,11 +24,6 @@ def _to_float32(pts):
     """将 (N, 1, 2) 或 (N, 2) 顶点转为 (N, 2) float32。"""
     arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
     return arr
-
-
-def _to_approx(pts):
-    """将 (N, 2) float32 转回 approxPolyDP 格式 (N, 1, 2) int。"""
-    return pts.reshape(-1, 1, 2).astype(np.int32)
 
 
 def _edge_len(p1, p2):
@@ -51,6 +46,14 @@ def polygon_edges(vertices):
     return edges
 
 
+def _project_onto_segment(pt, a, b):
+    """将 pt 投影到线段 ab 上，返回最近点。"""
+    ab = b - a
+    t = np.dot(pt - a, ab) / np.dot(ab, ab)
+    t = np.clip(t, 0.0, 1.0)
+    return a + t * ab
+
+
 # ============================================================
 #  仿射对齐
 # ============================================================
@@ -71,13 +74,20 @@ def align_matrix(edge_from, edge_to):
     vf = p2_f - p1_f
     vt = p2_t - p1_t
 
-    nf = vf / np.linalg.norm(vf)
-    nt = vt / np.linalg.norm(vt)
+    len_f = np.linalg.norm(vf)
+    len_t = np.linalg.norm(vt)
+    if len_f < 1e-9 or len_t < 1e-9:
+        # 零长度边 → 返回单位矩阵，避免 NaN
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, 1.0, 0.0]], dtype=np.float32)
+
+    nf = vf / len_f
+    nt = vt / len_t
 
     # 方向相反（切割边面对面）
     target = -nt
     cos_t = np.dot(nf, target)
-    sin_t = np.cross(nf, target)
+    sin_t = nf[0] * target[1] - nf[1] * target[0]  # 2D cross product (z-component)
 
     R = np.array([[cos_t, -sin_t],
                   [sin_t,  cos_t]])
@@ -98,35 +108,45 @@ def transform(M, pts):
 #  多边形融合
 # ============================================================
 
-def _check_quadrilateral_angles(vertices, angle_tolerance=20.0):
-    """
-    检测四边形的四个内角是否都在 90° ± angle_tolerance 范围内。
-    用于判断拼接结果是否为合法矩形。
-    """
+def _quadrilateral_angles(vertices):
+    """返回四边形的四个内角列表 [angle_deg, ...]，用于诊断。非四边形返回 None。"""
     if len(vertices) != 4:
-        return False
+        return None
 
     pts = _to_float32(vertices)
+    angles = []
 
     for i in range(4):
         prev = pts[(i - 1) % 4]
         curr = pts[i]
         nxt = pts[(i + 1) % 4]
 
-        # 内角 = prev→curr 与 curr→nxt 所夹的角
-        # 即向量 (prev-curr) 与 (nxt-curr) 之间的夹角
         v1 = prev - curr
         v2 = nxt - curr
         n1 = float(np.linalg.norm(v1))
         n2 = float(np.linalg.norm(v2))
         if n1 < 1e-9 or n2 < 1e-9:
-            return False
+            return None
 
         cos_a = np.dot(v1, v2) / (n1 * n2)
         cos_a = np.clip(cos_a, -1.0, 1.0)
         angle = float(np.degrees(np.arccos(cos_a)))
+        angles.append(angle)
 
-        if abs(angle - 90.0) > angle_tolerance:
+    return angles
+
+
+def _check_quadrilateral_angles(vertices, angle_tolerance=20.0):
+    """
+    检测四边形的四个内角是否都在 90° ± angle_tolerance 范围内。
+    用于判断拼接结果是否为合法矩形。
+    """
+    angles = _quadrilateral_angles(vertices)
+    if angles is None:
+        return False
+
+    for a in angles:
+        if abs(a - 90.0) > angle_tolerance:
             return False
 
     return True
@@ -188,7 +208,7 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
       1. 取中点融合成 v1, v2
       2. 按顺序串联顶点（排除贴合边端点）
       3. 简化（approxPolyDP）
-      4. 角度判断：邻边夹角 >= 175° → 融并该顶点
+      4. 角度判断：邻边夹角 >= 178° → 融并该顶点
     """
     fixed_f = _to_float32(fixed)
     moving_f = _to_float32(moving_aligned)
@@ -199,9 +219,11 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
     idx_m1 = ib_moving
     idx_m2 = (ib_moving + 1) % n_m
 
-    # ★ 步骤 1: 无论什么情况，先取中点融合成一个顶点
-    v1 = (fixed_f[idx_f1] + moving_f[idx_m2]) / 2.0
-    v2 = (fixed_f[idx_f2] + moving_f[idx_m1]) / 2.0
+    # ★ 步骤 1: 将 fixed 端点投影到 moving 的贴合边上，消除中点近似引入的折角
+    #    fixed[idx_f1] 对应 moving[idx_m2]→moving[idx_m1] 这条边
+    #    fixed[idx_f2] 对应 moving[idx_m2]→moving[idx_m1] 这条边
+    v1 = _project_onto_segment(fixed_f[idx_f1], moving_f[idx_m1], moving_f[idx_m2])
+    v2 = _project_onto_segment(fixed_f[idx_f2], moving_f[idx_m1], moving_f[idx_m2])
 
     # ★ 步骤 2: 按顶点顺序绕行，排除贴合边的四个端点
     ordered_pts = [v1]
@@ -227,8 +249,8 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
     merged = cv2.approxPolyDP(merged.astype(np.float32), 0.02 * peri, True)
     merged = merged.reshape(-1, 2)
 
-    # ★ 步骤 4: 遍历顶点，判断所接两条邻边的夹角，>= 175° 则融并
-    merged = merge_collinear_edges(merged, angle_threshold=175.0)
+    # ★ 步骤 4: 遍历顶点，判断所接两条邻边的夹角，>= 178° 则融并
+    merged = merge_collinear_edges(merged, angle_threshold=170.0)
 
     return merged  # (N, 2) float32
 
@@ -241,6 +263,9 @@ def masks_from_yolo(results, num_fragments=4):
     """从 YOLOv8 推理结果中提取多边形顶点列表。"""
     r = results[0]
     if r.masks is None:
+        return []
+
+    if r.orig_shape is None:
         return []
 
     h, w = r.orig_shape
@@ -270,7 +295,8 @@ def masks_from_yolo(results, num_fragments=4):
 # ============================================================
 
 def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
-               area_threshold, target_vertices, depth=1):
+               area_threshold, target_vertices,
+               frag_edges_cache=None, global_best=None):
     """
     DFS 回溯：尝试按 remaining_order 顺序逐个放置碎片。
 
@@ -285,90 +311,97 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     """
     if not remaining_order:
         # 所有碎片已放置，检查顶点数
+        nv = len(merged_poly)
+        if global_best is not None and nv < global_best[0]:
+            global_best[0] = nv
         return (merged_poly.copy(), [(idx, f.copy()) for idx, f in display_frags])
+
+    # ---- 跨 combo 剪枝：当前顶点数已不优于全局最优，放弃该分支 ----
+    if global_best is not None and len(merged_poly) >= global_best[0]:
+        # 注：添加碎片理论上最多减少 2 顶点（融并两条边 → 各减 2 端点 + 2 投影点），
+        # 但非完美匹配时顶点数几乎只增不减，因此以 >= 为阈值做启发式剪枝。
+        return None
 
     orig_idx = remaining_order[0]
     rest = remaining_order[1:]
     poly = polygons[orig_idx]
-    poly_edges = polygon_edges(poly)
+    poly_edges = frag_edges_cache[orig_idx] if frag_edges_cache else polygon_edges(poly)
 
     # ---- 使用融并后组合体的边来做匹配（非原始碎片边） ----
     merged_edges = polygon_edges(merged_poly)
 
-    # ---- 所有边对评分排序（长度差 >10% 直接跳过，不穷举） ----
+    # ---- 所有边对评分排序（长度差 >20% 直接跳过，不穷举） ----
     scored_pairs = []
     for mia, (mp1, mp2, m_len, _) in enumerate(merged_edges):
         for ib, (_, _, lb, _) in enumerate(poly_edges):
             diff = abs(m_len - lb)
             max_len_v = max(m_len, lb)
 
-            # 长度差超过 10% → 跳过，不计算仿射
-            if max_len_v > 0 and diff / max_len_v > 0.20:
+            # 长度差超过 20% → 跳过，不计算仿射
+            if max_len_v > 0 and diff / max_len_v > 0.30:
                 continue
 
-            M = align_matrix(poly_edges[ib], (mp1, mp2, m_len))
-            poly_aligned = transform(M, poly)
-
             score = (1.0 - diff / max_len_v) if max_len_v > 0 else 1.0
-
-            scored_pairs.append((score, diff, mia, ib, poly_aligned))
+            scored_pairs.append((score, mia, ib))
 
     scored_pairs.sort(key=lambda x: x[0], reverse=True)
 
     # ---- 依次尝试每条边对（DFS 回溯） ----
-    blacklist = set()
     best_result = None
     best_verts = float('inf')
 
-    for rank, (score, diff, mia, ib, poly_aligned) in enumerate(scored_pairs):
-        pair_key = (mia, ib)
-        if pair_key in blacklist:
+    # 预计算已放置碎片的面积（内层循环中不变）
+    base_frag_area = sum(float(cv2.contourArea(f.astype(np.float32)))
+                         for _, f in display_frags)
+
+    # merged_poly 转为 (N,1,2) 格式供 pointPolygonTest 复用
+    merged_contour = merged_poly.reshape(-1, 1, 2)
+
+    for score, mia, ib in scored_pairs:
+        # 延迟计算：只对实际尝试的边对计算仿射变换
+        mp1, mp2, m_len, _ = merged_edges[mia]
+        poly_aligned = transform(align_matrix(poly_edges[ib], (mp1, mp2, m_len)), poly)
+
+        # ---- 廉价预检：碎片质心在组合体内部 → 重叠过多，面积几乎必不过 ----
+        centroid = poly_aligned.mean(axis=0)
+        if cv2.pointPolygonTest(merged_contour, tuple(centroid), False) >= 0:
             continue
+
+        poly_aligned_area = float(cv2.contourArea(poly_aligned.astype(np.float32)))
 
         candidate_merged = merge_polygons(merged_poly, poly_aligned, mia, ib)
 
         # ---- 面积校验 ----
         merged_area = float(cv2.contourArea(candidate_merged.astype(np.float32)))
-        frag_areas = sum(float(cv2.contourArea(f.astype(np.float32)))
-                         for _, f in display_frags)
-        frag_areas += float(cv2.contourArea(poly_aligned.astype(np.float32)))
+        frag_areas = base_frag_area + poly_aligned_area
 
         area_ratio = (min(merged_area, frag_areas) /
                       max(merged_area, frag_areas) if max(merged_area, frag_areas) > 0 else 0.0)
 
-        lb = poly_edges[ib][2]
-        m_len_val = merged_edges[mia][2]
-        print(f"  [{depth}] "
-              f"组合体边[{mia}]={m_len_val:.1f}px  "
-              f"←→ 碎片{orig_idx+1}边[{ib}]={lb:.1f}px  "
-              f"得分={score:.3f}  "
-              f"融合面积={merged_area:.0f}  比值={area_ratio:.3f}")
-
         if area_ratio < area_threshold:
-            print(f"       ✗ 面积差过大，跳过")
-            blacklist.add(pair_key)
             continue
 
         # 递归放置剩余碎片
         new_display = display_frags + [(orig_idx, poly_aligned)]
         result = _dfs_place(polygons, candidate_merged, new_display, rest,
-                            area_threshold, target_vertices, depth + 1)
+                            area_threshold, target_vertices,
+                            frag_edges_cache=frag_edges_cache,
+                            global_best=global_best)
 
         if result is not None:
             mp, df = result
             nv = len(mp)
             if nv == target_vertices:
                 if _check_quadrilateral_angles(mp):
-                    print(f"       ✓ 接受（← {nv} 顶点，四角均 ≈90°）")
+                    if global_best is not None:
+                        global_best[0] = nv
                     return result  # 完美解，立即返回
                 else:
-                    print(f"       △ {nv} 顶点但角度偏离 90°，回溯")
                     # 记录为备选，继续回溯尝试其他组合
-                    if nv <= best_verts:
+                    if nv < best_verts:
                         best_verts = nv
                         best_result = result
             else:
-                print(f"       ✓ 接受（← {nv} 顶点）")
                 if nv < best_verts:
                     best_verts = nv
                     best_result = result
@@ -377,7 +410,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     return best_result
 
 
-def reassemble(masks, canvas_size=(640, 480), area_threshold=0.95, target_vertices=4):
+def reassemble(masks, area_threshold=0.95, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
 
@@ -400,55 +433,71 @@ def reassemble(masks, canvas_size=(640, 480), area_threshold=0.95, target_vertic
     if len(masks) < 2:
         raise ValueError(f"需要至少 2 个碎片，当前仅有 {len(masks)} 个")
 
+    start_time = time.time()
+
     polygons = [_to_float32(p) for p in masks]
     n = len(polygons)
 
+    # 预计算所有碎片的边列表（避免 DFS 中重复调用 np.linalg.norm）
+    frag_edges_cache = [polygon_edges(p) for p in polygons]
+
     best_result = None   # (merged_poly, display_frags)
     best_verts = float('inf')
-
-    combo = 0
+    global_best = [float('inf')]  # 跨 combo 共享最优顶点数（mutable 容器）
 
     # ---- 枚举所有固定碎片 + 放置顺序 ----
     for fixed_idx in range(n):
         remaining_ids = [i for i in range(n) if i != fixed_idx]
 
         for perm in itertools.permutations(remaining_ids):
-            combo += 1
-            print(f"\n{'='*50}")
-            print(f"组合 {combo}: 固定碎片 {fixed_idx + 1}, 放置顺序: "
-                  f"{' → '.join(str(i + 1) for i in perm)}")
+            # 剪枝：即便剩余碎片全完美融并（-2 顶点/个），终点数仍不优于已知最优 → 跳过
+            remaining_count = len(perm)
+            if (len(polygons[fixed_idx]) - 2 * remaining_count) >= global_best[0]:
+                continue
 
             merged_poly = polygons[fixed_idx].copy()
             display_frags = [(fixed_idx, polygons[fixed_idx].copy())]
 
-            result = _dfs_place(polygons, merged_poly, display_frags, list(perm),
-                                area_threshold, target_vertices, depth=1)
+            result = _dfs_place(polygons, merged_poly, display_frags, perm,
+                                area_threshold, target_vertices,
+                                frag_edges_cache=frag_edges_cache,
+                                global_best=global_best)
 
             if result is not None:
                 mp, df = result
                 nv = len(mp)
                 if nv == target_vertices and _check_quadrilateral_angles(mp):
-                    print(f"\n{'='*50}")
-                    print(f"★ 找到 {target_vertices} 顶点解（四角均 ≈90°）！固定碎片 {fixed_idx + 1}")
-                    print(f"{'='*50}")
+                    elapsed = time.time() - start_time
+                    print(f"✓ 拼接成功: {nv} 顶点 (四角均 ≈90°), 耗时 {elapsed:.1f}s")
                     canvas = draw_result(df, mp)
                     return canvas, [mp]
                 if nv < best_verts:
                     best_verts = nv
                     best_result = result
-                    print(f"  → 当前最优: {nv} 顶点 (目标 {target_vertices})")
+                    if nv < global_best[0]:
+                        global_best[0] = nv
 
     # ---- 回退：返回最接近目标顶点数的结果 ----
     if best_result is not None:
         mp, df = best_result
-        print(f"\n{'='*50}")
-        print(f"最终结果: {len(mp)} 顶点, {len(df)} 碎片 "
-              f"(未达到目标 {target_vertices} 顶点，已尝试所有组合)")
-        print(f"{'='*50}")
+        elapsed = time.time() - start_time
+        nv = len(mp)
+
+        if nv == target_vertices:
+            if _check_quadrilateral_angles(mp):
+                print(f"✓ 拼接成功: {nv} 顶点 (四角均 ≈90°), 耗时 {elapsed:.1f}s")
+            else:
+                angles = _quadrilateral_angles(mp)
+                angle_str = ", ".join(f"{a:.0f}°" for a in angles) if angles else "N/A"
+                print(f"✗ 部分成功: {nv} 顶点但角度偏离 (内角: {angle_str}), 耗时 {elapsed:.1f}s")
+        else:
+            print(f"△ 部分成功: {nv} 顶点 (未达目标 {target_vertices}), 耗时 {elapsed:.1f}s")
+
         canvas = draw_result(df, mp)
         return canvas, [mp]
 
-    raise ValueError("找不到任何合法的拼接方案")
+    elapsed = time.time() - start_time
+    raise ValueError(f"✗ 拼接失败: 无合法方案, 耗时 {elapsed:.1f}s")
 
 
 # ============================================================
@@ -532,6 +581,9 @@ def main():
                               "runs/segment_fragment_n/weights/best.pt")
     model = YOLO(model_path)
     img = cv2.imread(sys.argv[1])
+    if img is None:
+        print(f"错误: 无法读取图像 '{sys.argv[1]}'")
+        sys.exit(1)
     results = model(img, verbose=False, conf=0.5)
 
     try:
@@ -544,10 +596,15 @@ def main():
 
         cv2.imshow("Reassembly", canvas)
         cv2.waitKey(0)
-        cv2.imwrite("reassembled.jpg", canvas)
-        print("已保存: reassembled.jpg")
+        if not cv2.imwrite("reassembled.jpg", canvas):
+            print("警告: 保存 reassembled.jpg 失败（磁盘满或权限不足）")
+        else:
+            print("已保存: reassembled.jpg")
     except ValueError as e:
         print(f"错误: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"错误: {type(e).__name__}: {e}")
         sys.exit(1)
 
 
