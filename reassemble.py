@@ -136,7 +136,7 @@ def _quadrilateral_angles(vertices):
     return angles
 
 
-def _check_quadrilateral_angles(vertices, angle_tolerance=20.0):
+def _check_quadrilateral_angles(vertices, angle_tolerance=10.0):
     """
     检测四边形的四个内角是否都在 90° ± angle_tolerance 范围内。
     用于判断拼接结果是否为合法矩形。
@@ -332,7 +332,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
             max_len_v = max(m_len, lb)
 
             # 长度差超过 20% → 跳过，不计算仿射
-            if max_len_v > 0 and diff / max_len_v > 0.30:
+            if max_len_v > 0 and diff / max_len_v > 0.20:
                 continue
 
             score = (1.0 - diff / max_len_v) if max_len_v > 0 else 1.0
@@ -404,7 +404,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     return best_result
 
 
-def reassemble(masks, area_threshold=0.8, target_vertices=4):
+def reassemble(masks, area_threshold=0.92, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
 
