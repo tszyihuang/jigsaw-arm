@@ -227,6 +227,8 @@ def main():
                     cv2.imshow("Reassembled", canvas)
                     print("拼接完成 — 窗口 'Reassembled'")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"拼接失败: {e}")
 
     cap.release()

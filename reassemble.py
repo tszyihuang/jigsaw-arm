@@ -202,11 +202,11 @@ def masks_from_yolo(results, num_fragments=4):
 
 def reassemble(masks, canvas_size=(640, 480)):
     """
-    碎片拼接主逻辑。
+    碎片拼接主逻辑（迭代组合）。
 
     1. 随机挑选一个碎片固定
-    2. 遍历固定碎片的每条边，从其他碎片中找长度最接近的边
-    3. 仿射对齐：将碎片旋转/平移到贴合位置（不融合）
+    2. 逐个取剩余碎片，将其匹配到"已组合体"的所有边中最接近的那条
+    3. 对齐后加入组合体，下一轮以更大的组合体为基础继续匹配
     4. 显示所有对齐后的碎片
 
     Returns:
@@ -220,43 +220,56 @@ def reassemble(masks, canvas_size=(640, 480)):
 
     # ---- 1. 随机挑选一个固定 ----
     fixed_idx = random.randrange(n)
-    fixed_poly = polygons[fixed_idx]
-    aligned_frags = [fixed_poly.copy()]  # 第一个是固定碎片
+    aligned_frags = [(fixed_idx, polygons[fixed_idx].copy())]  # (原始编号, 顶点)
 
     remaining = [(i, polygons[i]) for i in range(n) if i != fixed_idx]
 
-    print(f"固定碎片: {fixed_idx + 1}  ({len(fixed_poly)} 顶点)")
+    print(f"固定碎片: {fixed_idx + 1}  ({len(polygons[fixed_idx])} 顶点)")
 
-    # ---- 2. 逐个对齐剩余碎片 ----
+    # ---- 2. 逐个对齐剩余碎片（每次基于整个已组合体） ----
     for step, (orig_idx, poly) in enumerate(remaining):
-        fixed_edges = polygon_edges(fixed_poly)
         poly_edges = polygon_edges(poly)
 
-        # 找长度最接近的边对
-        best_ia, best_ib = 0, 0
+        # 收集已组合体中所有碎片的所有边
+        # group_edges: [(p1, p2, length, local_idx, frag_order), ...]
+        group_edges = []
+        for frag_order, (fid, frag) in enumerate(aligned_frags):
+            for e in polygon_edges(frag):
+                group_edges.append((*e, frag_order, fid))
+
+        # 在组合体的所有边中找与当前碎片最接近的边
         best_diff = float('inf')
-        for ia, (_, _, la, _) in enumerate(fixed_edges):
+        best_ge = None   # 组合体中最佳边
+        best_ib = 0      # 当前碎片中最佳边索引
+
+        for ge in group_edges:
+            ge_p1, ge_p2, ge_len, ge_local_idx, ge_frag_order, ge_fid = ge
             for ib, (_, _, lb, _) in enumerate(poly_edges):
-                diff = abs(la - lb)
+                diff = abs(ge_len - lb)
                 if diff < best_diff:
                     best_diff = diff
-                    best_ia, best_ib = ia, ib
+                    best_ge = ge
+                    best_ib = ib
 
-        ia, ib = best_ia, best_ib
-        la, lb = fixed_edges[ia][2], poly_edges[ib][2]
-        print(f"  第 {step+1} 次对齐: 固定边[{ia}]={la:.1f}px  "
+        # 解包最佳匹配
+        _, _, ge_len, ge_local_idx, ge_frag_order, ge_fid = best_ge
+        ib = best_ib
+        lb = poly_edges[ib][2]
+
+        print(f"  第 {step+1} 次对齐: "
+              f"组合体(碎片{ge_fid+1})边[{ge_local_idx}]={ge_len:.1f}px  "
               f"←→ 碎片{orig_idx+1}边[{ib}]={lb:.1f}px  (差 {best_diff:.1f}px)")
 
-        # 仿射对齐：碎片边 → 固定边
-        M = align_matrix(poly_edges[ib], fixed_edges[ia])
+        # 仿射对齐：碎片边 → 组合体边
+        M = align_matrix(poly_edges[ib], (best_ge[0], best_ge[1], best_ge[2]))
         poly_aligned = transform(M, poly)
-        aligned_frags.append(poly_aligned)
+        aligned_frags.append((orig_idx, poly_aligned))
 
     print(f"共对齐 {len(aligned_frags) - 1} 个碎片")
 
     # ---- 3. 绘制 ----
-    canvas = draw_result(aligned_frags)
-    return canvas, aligned_frags
+    canvas = draw_result([f for _, f in aligned_frags])
+    return canvas, [f for _, f in aligned_frags]
 
 
 # ============================================================
