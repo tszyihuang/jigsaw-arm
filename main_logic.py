@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""机械臂主逻辑 — 第一步: 启动流程 + 控制台控制 (增量 / 绝对笛卡尔)
+"""机械臂主逻辑 — 第一步: 启动流程 + 控制台控制 (执行器绝对坐标)
 
 启动后:
   1. 机械臂移动到待机位置 (实际笛卡尔坐标 X=-9, Y=0, Z=+80 mm)
   2. 向 ESP32 发送 red_on, 红灯亮起, 并保持待机
-  3. 控制台输入指令移动机械臂:
+  3. 控制台输入指令移动机械臂 (坐标对应执行器中心, 含 TOOL_OFFSET 偏移):
        <Xmm> <Ymm> [Zmm]   绝对笛卡尔坐标, Z 缺省保持当前
-       例: 90 0 → 移动到 (X=90, Y=0)
+       例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
 
 极坐标换算 (由 arm_driver.forward_kinematics 的 FK 反解):
@@ -17,6 +17,11 @@
     ID4 由手腕水平参考自动维持.
     move_to_cartesian 采用 r<0 约定: r = -√(x²+y²), θ1 = atan2(y, x),
     使正 X 半平面 θ1 ∈ [-90°, 90°], 避开基座 ±90° 限位.
+    move_tool_to 求解执行器中心 (腕部 + TOOL_OFFSET_X/Y 偏移, 见 tool_center):
+    基座角由横向约束 x·sinθ1 + y·cosθ1 = TOOL_OFFSET_Y 解析确定,
+    臂平面内腕部目标 = 工具目标 - TOOL_OFFSET_X·(cosREF, sinREF),
+    REF = 手腕水平参考角 (ID4 维持水平 → 工具俯仰角恒定), 再迭代精修;
+    tool_to_wrist 转换后喂入 move_to_cartesian (腕部) 移动.
 
 用法:
     python3 main_logic.py                  # 自动检测 ESP32 串口
@@ -34,9 +39,12 @@ import serial
 from arm_driver import (
     Arm,
     JOINT_LIMITS,
+    TOOL_OFFSET_X,
+    TOOL_OFFSET_Y,
     detect_esp32_port,
     forward_kinematics,
     inverse_kinematics_plane,
+    tool_center,
 )
 
 # ── 待机位置 (实际笛卡尔坐标, mm) ───────────────────────────────────────────
@@ -260,6 +268,104 @@ class MainLogic:
                 print("  ⚠ 等待超时未到达")
         return target
 
+    def tool_to_wrist(self, x, y, z=None):
+        """执行器中心坐标 (x, y, z) → 腕部坐标 (真实几何腕部).
+
+        解析求解, 偏移定义参考 arm_driver.tool_center:
+          ① 基座角: 工具横向分量恒等于 TOOL_OFFSET_Y (与 ID4/臂型无关)
+             → x·sinθ1 + y·cosθ1 = TOOL_OFFSET_Y, 两分支取基座限位内者
+          ② 臂平面内: 腕部目标 = 工具目标 - TOOL_OFFSET_X·(cosREF, sinREF),
+             REF = 手腕水平参考角 (ID4 维持水平 → 工具俯仰角恒定)
+          ③ 用 arm_driver.tool_center 校验残差并迭代精修 (兜底 ID4 限位夹紧)
+
+        Args:
+            x, y: 执行器中心水平坐标 (mm)
+            z:    执行器中心 Z 高度 (mm), None 时保持当前 Z
+
+        Returns:
+            (wx, wy, wz): 腕部坐标 (mm); 不可达时返回 None.
+            注意: 直接喂入 move_to_cartesian 时 y 需取反 (见 move_tool_to).
+        """
+        if z is None:
+            _, _, z = tool_center(self.arm.get_joints())   # 保持当前执行器 Z
+
+        # ① 基座角: 由横向约束 x·sinθ1 + y·cosθ1 = TOOL_OFFSET_Y 解析求解
+        rho = math.hypot(x, y)
+        if rho < abs(TOOL_OFFSET_Y):
+            print(f"  ⚠ 目标距轴心 {rho:.1f}mm < 执行器横向偏移 "
+                  f"{abs(TOOL_OFFSET_Y):.0f}mm, 执行器中心不可达 — 保持原位置")
+            return None
+        alpha = math.atan2(y, x)
+        t = math.asin(TOOL_OFFSET_Y / rho)
+        lo1, hi1 = JOINT_LIMITS[1]
+        base_deg = None
+        for cand in (-alpha + t, -alpha + math.pi - t):    # 两分支 (左右镜像臂)
+            d = math.degrees(cand)
+            d = (d + 180.0) % 360.0 - 180.0
+            if lo1 <= d <= hi1:
+                base_deg = d
+                break
+        if base_deg is None:
+            print("  ⚠ 目标方位对应基座角超出限位 — 保持原位置")
+            return None
+
+        # ② 臂平面内: 腕部目标 = 工具目标 - 工具偏移 (方向恒为手腕水平参考角)
+        ref = self.arm.wrist_level_ref
+        if ref is None:
+            ref = 24.0
+        ref_rad = math.radians(ref)
+        base_rad = math.radians(base_deg)
+        r_tool = -math.cos(base_rad) * x + math.sin(base_rad) * y   # 工具径向分量
+        r_h = r_tool - TOOL_OFFSET_X * math.cos(ref_rad)
+        z_h = z - TOOL_OFFSET_X * math.sin(ref_rad)
+
+        # ③ 迭代精修 (解析解在 ID4 限位内已精确, 兜底夹紧/极端姿态)
+        err = float("inf")
+        for _ in range(10):
+            try:
+                id2, id3 = inverse_kinematics_plane(r_h, z_h)
+            except ValueError as e:
+                print(f"  ⚠ {e} — 保持原位置")
+                return None
+            id4 = self.arm.get_wrist_target(id2, id3)
+            joints = {1: base_deg, 2: id2, 3: id3, 4: id4}
+
+            tx, ty, tz = tool_center(joints)
+            err = math.sqrt((tx - x) ** 2 + (ty - y) ** 2 + (tz - z) ** 2)
+            if err < 0.5:
+                break
+            # 残差回代 (阻尼 0.5): 横向由 θ1 严格保证, 仅修正臂平面内分量
+            r_h += 0.5 * (r_tool - (-math.cos(base_rad) * tx + math.sin(base_rad) * ty))
+            z_h += 0.5 * (z - tz)
+        if err > 1.0:
+            print(f"  ⚠ 执行器中心未完全收敛 (残差 {err:.1f}mm) — 目标可能不可达")
+
+        # 腕部真实坐标 (r_h<0 折叠构型): x = -cosθ1·r_h, y = sinθ1·r_h
+        return -math.cos(base_rad) * r_h, math.sin(base_rad) * r_h, z_h
+
+    def move_tool_to(self, x, y, z=None, wait=True,
+                     speed_rpm=STANDBY_SPEED_RPM):
+        """移动执行器中心到绝对笛卡尔坐标 (X, Y, Z) — 控制台入口.
+
+        执行器中心 = 腕部 + 局部偏移 (TOOL_OFFSET_X=12, TOOL_OFFSET_Y=-36,
+        见 arm_driver.tool_center). 流程: tool_to_wrist 转换 → move_to_cartesian.
+
+        Returns:
+            target: 目标关节角 {1..4: deg}; 不可达时返回 None (未移动)
+        """
+        res = self.tool_to_wrist(x, y, z)
+        if res is None:
+            return None
+        wx, wy, wz = res
+        # y 镜像补偿: move_to_cartesian 的 θ1 = atan2(y, x) 约定使腕部落点为 (wx, -wy),
+        # 故传入 (wx, -wy), 实际腕部落在 (wx, wy), 执行器中心正好在 (x, y, z)
+        target = self.move_to_cartesian(wx, -wy, wz, wait=wait, speed_rpm=speed_rpm)
+        if target is None:
+            return None
+        tx, ty, tz = tool_center(target)
+        print(f"  ✓ 执行器中心预计到达 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
+        return target
+
     def _init_target_from_actual(self):
         """从实际关节角初始化目标状态 (未启动时调用 move_by_delta 的兜底)."""
         joints = self.arm.get_joints()
@@ -276,19 +382,21 @@ class MainLogic:
 
     def _print_usage(self):
         """打印控制台指令说明."""
-        print("控制台指令: <Xmm> <Ymm> [Zmm]   (绝对笛卡尔坐标, Z 缺省保持当前)")
+        print("控制台指令: <Xmm> <Ymm> [Zmm]   (执行器中心绝对坐标, Z 缺省保持当前)")
         print("           home               → 回到待机位置 (X=-9, Y=0, Z=80)")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
         print("      status    → 显示当前位置     ? / help → 本帮助")
 
     def _show_status(self):
-        """显示当前实际关节角与末端坐标."""
+        """显示当前实际关节角与执行器中心坐标."""
         joints = self.arm.get_joints()
         x, y, z = forward_kinematics(joints)
+        tx, ty, tz = tool_center(joints)
         print(f"  实际 ID1={joints[1]:+.1f}°  ID2={joints[2]:+.1f}°  "
               f"ID3={joints[3]:+.1f}°  ID4={joints[4]:+.1f}°")
-        print(f"        末端 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm")
+        print(f"        腕部   X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm")
+        print(f"        执行器 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
 
     def _apply_command(self, line):
         """解析控制台指令: 绝对笛卡尔 <Xmm> <Ymm> [Zmm] → move_to_cartesian."""
@@ -312,7 +420,7 @@ class MainLogic:
             return
         x, y = vals[0], vals[1]
         z = vals[2] if len(vals) > 2 else None
-        self.move_to_cartesian(x, y, z)
+        self.move_tool_to(x, y, z)
 
     # ── 第一步: 启动流程 ──
 

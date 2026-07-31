@@ -202,6 +202,11 @@ class Arm:
         lo, hi = JOINT_LIMITS[4]
         return max(lo, min(hi, target))
 
+    @property
+    def wrist_level_ref(self):
+        """手腕水平参考角 (°), 未锚定时为 None."""
+        return self._wrist_level_ref
+
     # ── 角度转换 ──
 
     def _to_logical(self, addr, motor_deg):
