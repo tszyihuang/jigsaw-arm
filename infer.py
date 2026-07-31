@@ -15,7 +15,7 @@ from reassemble import masks_from_yolo, reassemble, draw_exploded_view, create_c
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
 CAMERA_INDEX = 0
-WIDTH, HEIGHT = 800, 600
+WIDTH, HEIGHT = 640, 480
 FPS = 60
 CONF_THRESH = 0.5
 
