@@ -11,6 +11,7 @@
        n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
        action             下降到 Z_DOWN → 继电器吸合 → Z 回升到 0 (抓取)
        put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
+       trans <u> <v>      搬运: n <u> <v> 0 → action → n <u> <v+V_OFFSET> 0 → put
        r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
@@ -42,13 +43,17 @@ STANDBY_Z = 80.0
 STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
-ACTION_Z_DOWN = -38.0   # ① 下降到该高度
+ACTION_Z_DOWN = -40.0   # ① 下降到该高度
 ACTION_Z_UP   =   0.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
 ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
 ACTION_ACCEL_RPM_S = 50.0   # 梯形曲线加速度 (rpm/s, 0x26 平滑加减速)
 ACTION_DECEL_RPM_S = 50.0   # 梯形曲线减速度 (rpm/s)
+
+# ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
+TRANS_V_OFFSET = -330.0  # 放置点 V = 抓取点 V - 480 (所有情况都减去 480)
+TRANS_WAIT     = 1.0     # 各步骤之间的等待时间 (s)
 
 
 class MainLogic:
@@ -172,6 +177,7 @@ class MainLogic:
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
         print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
+        print(f"           trans <u> <v>      → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → 放下")
         print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
@@ -219,6 +225,27 @@ class MainLogic:
                               max_decel_rpm_s=ACTION_DECEL_RPM_S)
         print(f"  ✓ {'抓取' if mag_on else '放下'}完成")
 
+    def _run_trans(self, u, v):
+        """trans 搬运序列: 移动到抓取点 → 抓取 → 移动到放置点 → 放下.
+
+        u/v 为相机像素坐标; 放置点 V = 抓取点 V + TRANS_V_OFFSET,
+        各步骤之间等待 TRANS_WAIT 秒.
+        """
+        print(f"  [trans] ① 移动到抓取点: n {u:.0f} {v:.0f} 0")
+        self.arm.move_camera_to(u, v, 0.0)
+        time.sleep(TRANS_WAIT)
+        print("  [trans] ② 抓取 (action)")
+        self._run_action(mag_on=True)
+        time.sleep(TRANS_WAIT)
+        v_place = v + TRANS_V_OFFSET
+        print(f"  [trans] ③ 移动到放置点: n {u:.0f} {v_place:.0f} 0  "
+              f"(V{TRANS_V_OFFSET:+.0f})")
+        self.arm.move_camera_to(u, v_place, 0.0)
+        time.sleep(TRANS_WAIT)
+        print("  [trans] ④ 放下 (put)")
+        self._run_action(mag_on=False)
+        print("  ✓ trans 搬运完成")
+
     def _apply_command(self, line):
         """解析控制台指令: 绝对笛卡尔 <Xmm> <Ymm> [Zmm] → move_tool_to."""
         parts = line.split()
@@ -234,6 +261,17 @@ class MainLogic:
             return
         if parts[0] in ("put", "place"):
             self._run_action(mag_on=False)
+            return
+        if parts[0] == "trans":
+            try:
+                vals = [float(p) for p in parts[1:]]
+            except ValueError:
+                print("  ⚠ 格式错误, 请输入: trans <u> <v>  例如: trans 123 85")
+                return
+            if len(vals) != 2:
+                print("  ⚠ 需要两个参数 (相机像素坐标): trans <u> <v>  例如: trans 123 85")
+                return
+            self._run_trans(vals[0], vals[1])
             return
         if parts[0] in ("r", "servo"):
             if not self.servo:
