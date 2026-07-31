@@ -446,9 +446,36 @@ class CartesianArm:
 
     # ── 绝对坐标移动 ──
 
+    def _move_staggered(self, target, pending, speed_rpm=10.0, trapezoid=False,
+                        max_accel_rpm_s=200.0, max_decel_rpm_s=200.0):
+        """分关节延时移动: 无延时关节 t=0 一起发出, 延时关节按各自延时先后发出.
+
+        Args:
+            target: 完整目标关节角 {1..4: deg}
+            pending: {addr: (delay_s, 目标角度)} — 需延时的关节, 按延时升序执行
+        返回时所有关节指令均已发出, 到位等待由调用方 (wait_for_arrival) 负责.
+        """
+        t0 = time.monotonic()
+        others = {a: v for a, v in target.items() if a not in pending}
+        if others:
+            self.arm.move_all(others, speed_rpm=speed_rpm, trapezoid=trapezoid,
+                              max_accel_rpm_s=max_accel_rpm_s,
+                              max_decel_rpm_s=max_decel_rpm_s)
+        for addr, (delay, deg) in sorted(pending.items(),
+                                         key=lambda kv: kv[1][0]):
+            remaining = t0 + delay - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            print(f"    电机{addr} 延时 {delay:.1f}s 后旋转 → ID{addr}={deg:.1f}°")
+            self.arm.move_joint(addr, deg, speed_rpm=speed_rpm,
+                                trapezoid=trapezoid,
+                                max_accel_rpm_s=max_accel_rpm_s,
+                                max_decel_rpm_s=max_decel_rpm_s)
+
     def move_to_cartesian(self, x, y, z=None, wait=True, speed_rpm=10.0,
                           trapezoid=False, max_accel_rpm_s=200.0,
-                          max_decel_rpm_s=200.0, base_after_plane=True):
+                          max_decel_rpm_s=200.0, base_after_plane=True,
+                          joint_delays=None):
         """移动到腕部绝对笛卡尔坐标 (X, Y, Z).
 
         内部转换为极坐标 (基座角 θ1, 前伸 r) 后 IK 求解移动 (r<0 约定):
@@ -468,6 +495,10 @@ class CartesianArm:
             trapezoid: 使用梯形曲线 (0x26) 平滑加减速, 适合低速运动
             max_accel_rpm_s / max_decel_rpm_s: 梯形曲线加减速度 (rpm/s)
             base_after_plane: 分段移动 (先臂平面, 到位后再旋转基座)
+            joint_delays: 分关节延时旋转 {关节号: 秒}, 如 {3: 0.5, 4: 1.0}:
+                      无延时关节 t=0 一起先动, 各延时关节按延时先后到点后
+                      依次发出指令 (仅臂平面内关节 2/3/4 有效;
+                      目标角与当前相差 ≤0.5° 时自动跳过, 不产生空等).
 
         Returns:
             target: 目标关节角 {1..4: deg}; 超出限位 / IK 无解时返回 None (未移动)
@@ -493,14 +524,27 @@ class CartesianArm:
         self._target["base"], self._target["r"], self._target["z"] = base_deg, r, z
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
 
-        # 当前基座角: 分段判断与舵机旋转补偿共用一次读取
-        id1_cur = float("nan")
-        if base_after_plane or self.on_base_rotate is not None:
+        # 当前关节角: 分段判断 / 舵机补偿 / 分关节延时共用一次读取
+        joints_cur = {}
+        if base_after_plane or self.on_base_rotate is not None or joint_delays:
             try:
-                id1_cur = self.arm.get_joints()[1]
+                joints_cur = self.arm.get_joints()
             except (KeyError, IndexError):
                 pass
+        id1_cur = joints_cur.get(1, float("nan"))
         delta_base = base_deg - id1_cur   # 基座旋转角增量 (°, nan = 读取失败)
+
+        # 分关节延时 (如回升段 ID3 0.5s / ID4 1.0s): 无延时关节先动,
+        # 延时到点后再发对应关节指令. 仅目标角与当前相差 > 0.5° 的关节才延时
+        # (无需转动的直接跳过); 延时关节仅限臂平面内 2/3/4.
+        pending = {}   # addr → (delay, 目标角度)
+        if joint_delays:
+            for addr, delay in joint_delays.items():
+                if addr not in (2, 3, 4) or delay <= 0:
+                    continue
+                cur = joints_cur.get(addr, float("nan"))
+                if math.isnan(cur) or abs(target[addr] - cur) > 0.5:
+                    pending[addr] = (delay, target[addr])
 
         # 分段步骤: 基座无需转动 (或读取失败) 时退化为同步多轴移动
         segmented = False
@@ -518,10 +562,16 @@ class CartesianArm:
             print(f"  ① 臂平面内移动 → r={r:+.1f}mm  Z={z:+.1f}mm "
                   f"(基座保持 {id1_cur:+.1f}°)")
             print(f"    关节: ID2={id2:.1f}°  ID3={id3:.1f}°  ID4={id4:.1f}°")
-            self.arm.move_all(plane_target, speed_rpm=speed_rpm,
-                              trapezoid=trapezoid,
-                              max_accel_rpm_s=max_accel_rpm_s,
-                              max_decel_rpm_s=max_decel_rpm_s)
+            if pending:
+                self._move_staggered(plane_target, pending,
+                                     speed_rpm=speed_rpm, trapezoid=trapezoid,
+                                     max_accel_rpm_s=max_accel_rpm_s,
+                                     max_decel_rpm_s=max_decel_rpm_s)
+            else:
+                self.arm.move_all(plane_target, speed_rpm=speed_rpm,
+                                  trapezoid=trapezoid,
+                                  max_accel_rpm_s=max_accel_rpm_s,
+                                  max_decel_rpm_s=max_decel_rpm_s)
             if self.wait_for_arrival(plane_target):
                 print("  ✓ 平面移动到位")
             else:
@@ -534,9 +584,15 @@ class CartesianArm:
                                 max_decel_rpm_s=max_decel_rpm_s)
             self._notify_base_rotate(delta_base)
         else:
-            self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
-                              max_accel_rpm_s=max_accel_rpm_s,
-                              max_decel_rpm_s=max_decel_rpm_s)
+            if pending:
+                self._move_staggered(target, pending,
+                                     speed_rpm=speed_rpm, trapezoid=trapezoid,
+                                     max_accel_rpm_s=max_accel_rpm_s,
+                                     max_decel_rpm_s=max_decel_rpm_s)
+            else:
+                self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
+                                  max_accel_rpm_s=max_accel_rpm_s,
+                                  max_decel_rpm_s=max_decel_rpm_s)
             self._notify_base_rotate(delta_base)
 
         print(f"  目标 → 笛卡尔 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm  "
@@ -625,7 +681,7 @@ class CartesianArm:
 
     def move_tool_to(self, x, y, z=None, wait=True, speed_rpm=10.0,
                      trapezoid=False, max_accel_rpm_s=200.0,
-                     max_decel_rpm_s=200.0):
+                     max_decel_rpm_s=200.0, joint_delays=None):
         """移动执行器中心到绝对笛卡尔坐标 (X, Y, Z).
 
         执行器中心 = 腕部 + 局部偏移 (TOOL_OFFSET_X=12, TOOL_OFFSET_Y=-36,
@@ -634,6 +690,7 @@ class CartesianArm:
         Args:
             trapezoid: 使用梯形曲线 (0x26) 平滑加减速, 适合低速运动
             max_accel_rpm_s / max_decel_rpm_s: 梯形曲线加减速度 (rpm/s)
+            joint_delays: 分关节延时 {关节号: 秒}, 透传给 move_to_cartesian
 
         Returns:
             target: 目标关节角 {1..4: deg}; 不可达时返回 None (未移动)
@@ -647,7 +704,8 @@ class CartesianArm:
         target = self.move_to_cartesian(wx, -wy, wz, wait=wait, speed_rpm=speed_rpm,
                                         trapezoid=trapezoid,
                                         max_accel_rpm_s=max_accel_rpm_s,
-                                        max_decel_rpm_s=max_decel_rpm_s)
+                                        max_decel_rpm_s=max_decel_rpm_s,
+                                        joint_delays=joint_delays)
         if target is None:
             return None
         tx, ty, tz = tool_center(target)

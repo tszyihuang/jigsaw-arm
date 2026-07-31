@@ -60,12 +60,14 @@ ACTION_Z_DOWN = -41.0   # ① 下降到该高度
 ACTION_Z_UP   =   -20.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
-ACTION_SPEED_RPM = 6.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
+ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
+ACTION_ID3_DELAY = 0.5   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
+ACTION_ID4_DELAY = 0.5   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
 TRANS_V_OFFSET = -330.0  # 放置点 V = 抓取点 V - 480 (所有情况都减去 480)
 TRANS_WAIT     = 1.0     # 各步骤之间的等待时间 (s)
-TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤")   # 序列步骤圈号 (最多 5 步)
+TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤", "⑥")   # 序列步骤圈号 (最多 6 步)
 
 
 class MainLogic:
@@ -259,7 +261,7 @@ class MainLogic:
         print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
         print(f"           trans <u> <v> [角度] → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → [舵机旋转角度] → 放下")
-        print("                       角度可选 (放置点放下前旋转, 正=逆时针), 例如: trans 300 200 +60")
+        print("                       角度可选 (放置点放下前旋转, 放下后反向回旋防缠绕, 正=逆时针), 例如: trans 300 200 +60")
         print(f"           transport <u1> <v1> <u2> <v2> [角度] → 同 trans, 但放置点显式指定 (V2 仍 {TRANS_V_OFFSET:+.0f})")
         print("                       例如: transport 200 200 300 300 +60 → 放置点 (300, -30)")
         print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
@@ -302,8 +304,11 @@ class MainLogic:
             self.esp.relay_off()
         time.sleep(ACTION_WAIT_MAG)
         print(f"  [动作] ④ Z 回升到 {ACTION_Z_UP:.0f} mm "
-              f"(转速 {ACTION_SPEED_RPM:.0f} rpm)")
-        self.arm.move_tool_to(tx, ty, ACTION_Z_UP, speed_rpm=ACTION_SPEED_RPM)
+              f"(转速 {ACTION_SPEED_RPM:.0f} rpm, "
+              f"电机3/4 分步延时 {ACTION_ID3_DELAY:.1f}s/{ACTION_ID4_DELAY:.1f}s)")
+        self.arm.move_tool_to(tx, ty, ACTION_Z_UP, speed_rpm=ACTION_SPEED_RPM,
+                              joint_delays={3: ACTION_ID3_DELAY,
+                                            4: ACTION_ID4_DELAY})
         print(f"  ✓ {'抓取' if mag_on else '放下'}完成")
 
     def _run_trans(self, u, v, angle_deg=None, u_place=None, v_place=None):
@@ -317,7 +322,8 @@ class MainLogic:
 
         angle_deg 非 None 时, 在移动到放置点后、放下前让舵机相对转动
         该角度 (在放置点旋转碎片, 正=逆时针), 例如 trans 300 200 +60.
-        舵机未连接时警告并跳过旋转, 搬运流程继续.
+        放下 (put) 完成后, 舵机再反向回旋相同度数, 防止线材缠绕.
+        舵机未连接时警告并跳过旋转/回旋, 搬运流程继续.
         """
         u_place = u if u_place is None else u_place
         v_place = (v if v_place is None else v_place) + TRANS_V_OFFSET
@@ -355,6 +361,25 @@ class MainLogic:
         step += 1
         print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 放下 (put)")
         self._run_action(mag_on=False)
+        if angle_deg is not None:
+            step += 1
+            if not self.servo:
+                print(f"  ⚠ 舵机未连接, 跳过反向回旋 {angle_deg:+.0f}°")
+            else:
+                # 放下后反向回旋相同度数, 防止线材缠绕
+                print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 舵机反向回旋 "
+                      f"{angle_deg:+.0f}° (防止线材缠绕)")
+                new_pos = self.servo.move_relative_deg(-angle_deg,
+                                                       target_speed=SERVO_SPEED)
+                if new_pos is None:
+                    print("  ⚠ 读取舵机当前位置失败, 未回旋")
+                else:
+                    print(f"  ✓ 舵机 → 新位置 {new_pos} "
+                          f"({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
+                    if self.servo.wait_for_arrival(new_pos):
+                        print("  ✓ 舵机回旋到位")
+                    else:
+                        print("  ⚠ 舵机回旋等待超时")
         print("  ✓ trans 搬运完成")
 
     def _apply_command(self, line):
