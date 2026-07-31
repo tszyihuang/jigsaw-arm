@@ -410,8 +410,9 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
         mp1, mp2, m_len, _ = merged_edges[mia]
         M = align_matrix(poly_edges[ib], (mp1, mp2, m_len))
         poly_aligned = transform(M, poly)
-        # 旋转角（相对原始位姿；屏幕坐标 y 向下：顺时针为负、逆时针为正）
-        rot_deg = -math.degrees(math.atan2(M[1, 0], M[0, 0]))
+        # 旋转角（相对原始位姿；屏幕坐标 y 向下：顺时针为正、逆时针为负,
+        # 已取反, 与舵机方向约定一致）
+        rot_deg = math.degrees(math.atan2(M[1, 0], M[0, 0]))
 
         # ---- 廉价预检：碎片质心在组合体内部 → 重叠过多，面积几乎必不过 ----
         centroid = poly_aligned.mean(axis=0)
@@ -555,7 +556,7 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
 
     Args:
         fragments: [(idx, poly, rot_deg), ...] 已对齐的碎片列表
-                   (rot_deg 为相对原始位姿的旋转角, 顺时针为负、逆时针为正)
+                   (rot_deg 为相对原始位姿的旋转角, 顺时针为正、逆时针为负)
         gap: 缩放系数，越大推得越开（默认 0.3）
         canvas_size: 输出画布尺寸 (宽, 高)
 
@@ -598,7 +599,7 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
             cv2.putText(canvas, f"({cx}, {cy})", (cx + 10, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, CENTROID_COLOR, 1)
 
-            # 旋转角标识（相对原图形；顺时针为负、逆时针为正；固定碎片为 0°）
+            # 旋转角标识（相对原图形；顺时针为正、逆时针为负；固定碎片为 0°）
             rot_text = f"{rot_deg:+.0f}" if rot_deg else "0"
             rot_size, _ = cv2.getTextSize(rot_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             cv2.putText(canvas, rot_text, (cx - 15, cy + 28),
