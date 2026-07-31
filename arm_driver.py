@@ -62,6 +62,19 @@ def arm_to_camera(x, y):
     return u, v
 
 
+def camera_to_arm(u, v):
+    """摄像头像素坐标 (u, v) [px] → 机械臂水平面坐标 (x, y) [mm].
+
+    为 arm_to_camera 的逆变换 (2×2 矩阵求逆).
+    """
+    det = CAMERA_A[0][0] * CAMERA_A[1][1] - CAMERA_A[0][1] * CAMERA_A[1][0]
+    dx = u - CAMERA_A[2][0]
+    dy = v - CAMERA_A[2][1]
+    x = (CAMERA_A[1][1] * dx - CAMERA_A[0][1] * dy) / det
+    y = (-CAMERA_A[1][0] * dx + CAMERA_A[0][0] * dy) / det
+    return x, y
+
+
 # ── 正运动学 (FK) ───────────────────────────────────────────────────────────
 def forward_kinematics(joints):
     """关节角度 → (x, y, z).  joints: {1..4: deg}"""
@@ -514,6 +527,18 @@ class CartesianArm:
         tx, ty, tz = tool_center(target)
         print(f"  ✓ 执行器中心预计到达 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
         return target
+
+    def move_camera_to(self, u, v, z=None, wait=True, speed_rpm=10.0):
+        """摄像头像素坐标 (u, v) → 线性变换 → 执行器中心坐标 → 移动.
+
+        逆变换 (camera_to_arm) 后喂入 move_tool_to, 默认保持当前 Z 高度.
+
+        Returns:
+            target: 目标关节角 {1..4: deg}; 不可达时返回 None (未移动)
+        """
+        x, y = camera_to_arm(u, v)
+        print(f"  相机 ({u:.0f}, {v:.0f}) px → 执行器 (X={x:.1f}, Y={y:.1f}) mm")
+        return self.move_tool_to(x, y, z, wait=wait, speed_rpm=speed_rpm)
 
     def _init_target_from_actual(self):
         """从实际关节角初始化目标状态 (未启动时调用的兜底)."""

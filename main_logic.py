@@ -6,6 +6,7 @@
   2. 向 ESP32 发送 red_on, 红灯亮起, 并保持待机
   3. 控制台输入指令移动机械臂 (坐标对应执行器中心, 含 TOOL_OFFSET 偏移):
        <Xmm> <Ymm> [Zmm]   绝对笛卡尔坐标, Z 缺省保持当前
+       n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
        status              显示当前位置     ? / help → 本帮助
@@ -94,10 +95,12 @@ class MainLogic:
     def _print_usage(self):
         """打印控制台指令说明."""
         print("控制台指令: <Xmm> <Ymm> [Zmm]   (执行器中心绝对坐标, Z 缺省保持当前)")
+        print("           n <u> <v> [Zmm]     (摄像头像素坐标, Z 缺省保持当前)")
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
+        print("      n 123 85  → 相机像素 → 执行器坐标移动 (≈ X=90, Y=-8.4)")
 
     def _show_status(self):
         """显示当前实际关节角与执行器中心坐标."""
@@ -116,6 +119,22 @@ class MainLogic:
         if parts[0] in ("home", "standby"):
             self.arm.go_home(STANDBY_X, STANDBY_Y, STANDBY_Z,
                              speed_rpm=STANDBY_SPEED_RPM)
+            return
+        if parts[0] in ("n", "cam"):
+            try:
+                vals = [float(p) for p in parts[1:]]
+            except ValueError:
+                print("  ⚠ 格式错误, 请输入: n <u> <v> [Zmm]  例如: n 123 85")
+                return
+            if len(vals) < 2:
+                print("  ⚠ 至少需要 U 和 V: n <u> <v>  例如: n 123 85")
+                return
+            if len(vals) > 3:
+                print("  ⚠ 参数过多, 最多 3 个: n <u> <v> [Zmm]")
+                return
+            u, v = vals[0], vals[1]
+            z = vals[2] if len(vals) > 2 else None
+            self.arm.move_camera_to(u, v, z)
             return
         try:
             vals = [float(p) for p in parts]
