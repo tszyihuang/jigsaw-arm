@@ -9,6 +9,8 @@
   4. 控制台输入指令移动机械臂 (坐标对应执行器中心, 含 TOOL_OFFSET 偏移):
        <Xmm> <Ymm> [Zmm]   绝对笛卡尔坐标, Z 缺省保持当前
        n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
+       action             下降到 Z_DOWN → 继电器吸合 → Z 回升到 0 (抓取)
+       put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
        status              显示当前位置     ? / help → 本帮助
@@ -37,11 +39,11 @@ STANDBY_Z = 80.0
 STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
-ACTION_Z_DOWN = -20.0   # ① 下降到该高度
+ACTION_Z_DOWN = -38.0   # ① 下降到该高度
 ACTION_Z_UP   =   0.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
-ACTION_SPEED_RPM = 2.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
+ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
 ACTION_ACCEL_RPM_S = 50.0   # 梯形曲线加速度 (rpm/s, 0x26 平滑加减速)
 ACTION_DECEL_RPM_S = 50.0   # 梯形曲线减速度 (rpm/s)
 
@@ -149,7 +151,8 @@ class MainLogic:
         print("控制台指令: <Xmm> <Ymm> [Zmm]   (执行器中心绝对坐标, Z 缺省保持当前)")
         print("           n <u> <v> [Zmm]     (摄像头像素坐标, Z 缺省保持当前)")
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
-        print("           action / act       → 下降到 Z=-20 → 继电器吸合 → Z 回升到 0")
+        print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
+        print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
@@ -163,15 +166,16 @@ class MainLogic:
         print(f"        腕部   X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm")
         print(f"        执行器 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
 
-    def _run_action(self):
-        """动作序列: 当前位置 → 下降到 Z=-20 → 等 1s → 继电器吸合 → 等 0.5s → Z 升到 0.
+    def _run_action(self, mag_on=True):
+        """抓取/放下序列: 当前位置 → 下降到 Z_DOWN → 等 1s → 继电器吸合/释放 → 等 0.5s → Z 回升到 0.
 
+        mag_on=True  → 继电器吸合 (action 抓取); mag_on=False → 继电器释放 (put 放下).
         保持当前 X/Y 不变, 只改变执行器中心 Z 高度.
         """
         if not self.esp:
-            print("  ⚠ ESP32 未连接, 无法启动继电器 — 动作中止")
+            print("  ⚠ ESP32 未连接, 无法控制继电器 — 动作中止")
             return
-        joints, (x, y, z), (tx, ty, tz) = self.arm.status()
+        *_, (tx, ty, tz) = self.arm.status()
         print(f"  [动作] 当前位置: 执行器 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
         print(f"  [动作] ① 下降到 Z={ACTION_Z_DOWN:.0f} mm "
               f"(转速 {ACTION_SPEED_RPM:.0f} rpm, 梯形曲线)")
@@ -180,15 +184,20 @@ class MainLogic:
                               max_decel_rpm_s=ACTION_DECEL_RPM_S)
         print(f"  [动作] ② 等待 {ACTION_WAIT_DOWN:.0f}s")
         time.sleep(ACTION_WAIT_DOWN)
-        print(f"  [动作] ③ 继电器吸合 (mag_high)")
-        self.esp.relay_on()
+        name = "吸合" if mag_on else "释放"
+        cmd = "mag_high" if mag_on else "mag_low"
+        print(f"  [动作] ③ 继电器{name} ({cmd})")
+        if mag_on:
+            self.esp.relay_on()
+        else:
+            self.esp.relay_off()
         time.sleep(ACTION_WAIT_MAG)
         print(f"  [动作] ④ Z 回升到 {ACTION_Z_UP:.0f} mm "
               f"(转速 {ACTION_SPEED_RPM:.0f} rpm, 梯形曲线)")
         self.arm.move_tool_to(tx, ty, ACTION_Z_UP, speed_rpm=ACTION_SPEED_RPM,
                               trapezoid=True, max_accel_rpm_s=ACTION_ACCEL_RPM_S,
                               max_decel_rpm_s=ACTION_DECEL_RPM_S)
-        print("  ✓ 动作完成")
+        print(f"  ✓ {'抓取' if mag_on else '放下'}完成")
 
     def _apply_command(self, line):
         """解析控制台指令: 绝对笛卡尔 <Xmm> <Ymm> [Zmm] → move_tool_to."""
@@ -201,7 +210,10 @@ class MainLogic:
                              speed_rpm=STANDBY_SPEED_RPM)
             return
         if parts[0] in ("action", "act"):
-            self._run_action()
+            self._run_action(mag_on=True)
+            return
+        if parts[0] in ("put", "place"):
+            self._run_action(mag_on=False)
             return
         if parts[0] in ("n", "cam"):
             try:
