@@ -366,7 +366,9 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
         nv = len(merged_poly)
         if global_best is not None and nv < global_best[0]:
             global_best[0] = nv
-        return (merged_poly.copy(), [(idx, f.copy()) for idx, f in display_frags], list(edge_matches))
+        return (merged_poly.copy(),
+                [(idx, f.copy(), r) for idx, f, r in display_frags],
+                list(edge_matches))
 
     orig_idx = remaining_order[0]
     rest = remaining_order[1:]
@@ -398,7 +400,7 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
 
     # 预计算已放置碎片的面积（内层循环中不变）
     base_frag_area = sum(float(cv2.contourArea(f.astype(np.float32)))
-                         for _, f in display_frags)
+                         for _, f, _ in display_frags)
 
     # merged_poly 转为 (N,1,2) 格式供 pointPolygonTest 复用
     merged_contour = merged_poly.reshape(-1, 1, 2)
@@ -406,7 +408,10 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
     for score, mia, ib in scored_pairs:
         # 延迟计算：只对实际尝试的边对计算仿射变换
         mp1, mp2, m_len, _ = merged_edges[mia]
-        poly_aligned = transform(align_matrix(poly_edges[ib], (mp1, mp2, m_len)), poly)
+        M = align_matrix(poly_edges[ib], (mp1, mp2, m_len))
+        poly_aligned = transform(M, poly)
+        # 旋转角（相对原始位姿；屏幕坐标 y 向下：顺时针为负、逆时针为正）
+        rot_deg = -math.degrees(math.atan2(M[1, 0], M[0, 0]))
 
         # ---- 廉价预检：碎片质心在组合体内部 → 重叠过多，面积几乎必不过 ----
         centroid = poly_aligned.mean(axis=0)
@@ -428,7 +433,7 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
             continue
 
         # 递归放置剩余碎片
-        new_display = display_frags + [(orig_idx, poly_aligned)]
+        new_display = display_frags + [(orig_idx, poly_aligned, rot_deg)]
         new_edge_matches = edge_matches + [(mp1.copy(), mp2.copy())]
         result = _dfs_place(polygons, candidate_merged, new_display, new_edge_matches, rest,
                             area_threshold, target_vertices,
@@ -478,7 +483,8 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
     几何中心坐标。
 
     Args:
-        fragments: [(idx, poly), ...] 已对齐的碎片列表
+        fragments: [(idx, poly, rot_deg), ...] 已对齐的碎片列表
+                   (rot_deg 为相对原始位姿的旋转角, 顺时针为负、逆时针为正)
         gap: 缩放系数，越大推得越开（默认 0.3）
         canvas_size: 输出画布尺寸 (宽, 高)
 
@@ -490,7 +496,7 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
 
     tw, th = canvas_size
     n = len(fragments)
-    originals = [f.copy() for _, f in fragments]
+    originals = [f.copy() for _, f, _ in fragments]
     positions = [f.copy() for f in originals]
 
     # 1. 计算每个碎片的质心 + 整体重心
@@ -542,7 +548,7 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
     # ---- 绘制 ----
     canvas = np.full((th, tw, 3), 30, dtype=np.uint8)
 
-    for i, (orig_idx, frag) in enumerate(fragments):
+    for i, (orig_idx, _frag, rot_deg) in enumerate(fragments):
         color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
         thickness = 3 if i == 0 else 2
 
@@ -568,6 +574,15 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
             cv2.circle(canvas, (cx, cy), CENTROID_RADIUS, CENTROID_COLOR, CENTROID_THICKNESS)
             cv2.putText(canvas, f"({cx}, {cy})", (cx + 10, cy - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, CENTROID_COLOR, 1)
+
+            # 旋转角标识（相对原图形；顺时针为负、逆时针为正；固定碎片为 0°）
+            rot_text = f"{rot_deg:+.0f}" if rot_deg else "0"
+            rot_size, _ = cv2.getTextSize(rot_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.putText(canvas, rot_text, (cx - 15, cy + 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+            # 度符号 "°" 手工画小圆点（Hershey 字体无此字符, putText 会画成 "?"）
+            cv2.circle(canvas, (cx - 15 + rot_size[0] + 2, cy + 28 - rot_size[1] + 2),
+                       2, (0, 255, 255), 1)
 
     return canvas
 
@@ -618,7 +633,7 @@ def reassemble(masks, area_threshold=0.92, target_vertices=4):
                 continue
 
             merged_poly = polygons[fixed_idx].copy()
-            display_frags = [(fixed_idx, polygons[fixed_idx].copy())]
+            display_frags = [(fixed_idx, polygons[fixed_idx].copy(), 0.0)]
             edge_matches = [None]  # 固定碎片没有匹配边
 
             result = _dfs_place(polygons, merged_poly, display_frags, edge_matches, perm,
@@ -688,7 +703,7 @@ def draw_result(fragments, merged=None):
     - 白色粗轮廓 = 融合后的最终多边形（如果提供）
     - #1 #2 ... 标注选择顺序
     """
-    all_pts_list = [f for _, f in fragments]
+    all_pts_list = [f for _, f, _ in fragments]
     if merged is not None:
         all_pts_list.append(merged)
     all_pts = np.vstack(all_pts_list).astype(np.int32)
@@ -703,7 +718,7 @@ def draw_result(fragments, merged=None):
     canvas = np.full((h, w, 3), 30, dtype=np.uint8)
 
     # --- 各碎片（半透明） ---
-    for i, (_, frag) in enumerate(fragments):
+    for i, (_, frag, _) in enumerate(fragments):
         color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
         thickness = 3 if i == 0 else 2   # 第1个碎片（固定）用粗轮廓
 
