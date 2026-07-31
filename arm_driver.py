@@ -2,7 +2,7 @@
 """四轴机械臂 — 坐标显示 + 键盘控制 + 控制台移动 (极简版)
 
 坐标系: +X=左 +Y=前 +Z=上  (右手定则)
-按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  Q/ESC→退出
+按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  空格→继电器切换  Q/ESC→退出
 控制台: 输入增量 <Δ角度°> [Δ前伸mm] [ΔZmm]  例如: 10 100 → 基座+10°, 臂+100mm
 """
 
@@ -12,6 +12,8 @@ import sys
 import time
 import argparse
 import keyboard
+import serial
+import serial.tools.list_ports
 
 from GIM4310_driver import MotorBus, SERIAL_PORT, BAUDRATE
 
@@ -220,11 +222,69 @@ class Arm:
         return False
 
 
+# ── ESP32 继电器 (串口) ─────────────────────────────────────────────────────
+RELAY_BAUDRATE = 115200
+MAG_ON_CMD = "mag_high"    # 吸合
+MAG_OFF_CMD = "mag_low"    # 断开
+ESP32_VENDOR_HINTS = {
+    0x10C4,  # Silicon Labs CP210x
+    0x1A86,  # QinHeng CH340/CH341
+    0x0403,  # FTDI
+    0x303A,  # Espressif 原生 USB (ESP32-S2/S3/C3)
+}
+
+
+def detect_esp32_port():
+    """自动检测 ESP32 所在串口 (优先 VID 匹配, 其次唯一串口), 找不到返回 None."""
+    ports = serial.tools.list_ports.comports()
+    for p in ports:
+        if p.vid in ESP32_VENDOR_HINTS:
+            return p.device
+    if len(ports) == 1:
+        return ports[0].device
+    return None
+
+
+class Relay:
+    """ESP32 继电器 — 串口指令 mag_high/mag_low 切换通断."""
+
+    def __init__(self, port, initial_off=True):
+        self._on = False
+        self._ser = serial.Serial(port, RELAY_BAUDRATE, timeout=0.1)
+        time.sleep(1.0)                   # 等 ESP32 启动
+        self._ser.reset_input_buffer()    # 丢弃 ESP32 启动信息
+        if initial_off:
+            self.set(False)               # 上电默认断开, 保证安全
+
+    @property
+    def is_on(self):
+        return self._on
+
+    def set(self, on):
+        cmd = MAG_ON_CMD if on else MAG_OFF_CMD
+        self._ser.write((cmd + "\n").encode("utf-8"))
+        self._on = on
+
+    def toggle(self):
+        """切换通断, 返回新状态."""
+        self.set(not self._on)
+        return self._on
+
+    def close(self):
+        try:
+            self.set(False)               # 退出时确保断开
+        except Exception:
+            pass
+        self._ser.close()
+
+
 # ── 主循环 ──────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="四轴机械臂坐标显示 + 键盘控制")
     parser.add_argument("--port", default=SERIAL_PORT)
     parser.add_argument("--baud", type=int, default=BAUDRATE)
+    parser.add_argument("--relay-port", default=None,
+                        help="ESP32 继电器串口 (默认自动检测)")
     args = parser.parse_args()
 
     STEP_MM = 2.0    # 平移步长 (mm)
@@ -248,11 +308,45 @@ def main():
         print(f"初始: X={x0:.1f} Y={y0:.1f} Z={z0:.1f}  "
               f"ID1={id1_target:.1f}°")
 
+        # ── 继电器 (空格切换通断) ──
+        relay = None
+        esp_port = args.relay_port or detect_esp32_port()
+        if esp_port:
+            try:
+                relay = Relay(esp_port)
+                print(f"继电器已连接: {esp_port}  (按 空格 切换通断)")
+            except Exception as e:
+                print(f"⚠ 继电器连接失败: {e} — 空格键不可用")
+        else:
+            print("⚠ 未检测到 ESP32, 空格键不可用 (可用 --relay-port 指定)")
+
+        space_pending = [False]   # 空格按下待处理 (回调线程置位, 主循环消费)
+
+        def _on_key(e):
+            if e.name == "space":
+                space_pending[0] = True
+
+        keyboard.on_press(_on_key)
+
+        # ── 状态回读节流: 每圈读 4 个电机应答会阻塞总线/终端, 是"不丝滑"的根源 ──
+        STATUS_INTERVAL = 0.1          # 状态显示刷新间隔 (10 Hz)
+        last_status = time.monotonic()
+
         try:
             while True:
                 if keyboard.is_pressed('esc') or keyboard.is_pressed('q'):
                     print("\n退出")
                     break
+
+                # ── 继电器切换: 空格 ──
+                if space_pending[0]:
+                    space_pending[0] = False
+                    if relay:
+                        on = relay.toggle()
+                        print(f"\n继电器 {'吸合 ON' if on else '断开 OFF'} "
+                              f"({MAG_ON_CMD if on else MAG_OFF_CMD})")
+                    else:
+                        print("\n⚠ 继电器未连接")
 
                 dirty = False
 
@@ -306,19 +400,28 @@ def main():
                         r_target, z_target = r_old, z_old
                         id1_target = id1_old
 
-                # ── 读一次当前状态 ──
-                joints = arm.get_joints()
-                ax, ay, az = forward_kinematics(joints)
+                # ── 状态回读与显示: 节流到 10 Hz, 不阻塞控制指令 ──
+                now = time.monotonic()
+                if now - last_status >= STATUS_INTERVAL:
+                    last_status = now
+                    joints = arm.get_joints()
+                    ax, ay, az = forward_kinematics(joints)
 
-                print(f"\r实际 X={ax:+8.1f} Y={ay:+8.1f} Z={az:+8.1f}  |  "
-                      f"目标 角度={id1_target:+7.1f}° r={r_target:+7.1f}mm Z={z_target:+7.1f}mm  |  "
-                      f"J1={joints[1]:+7.1f} J2={joints[2]:+7.1f} J3={joints[3]:+7.1f} J4={joints[4]:+7.1f}",
-                      end="", flush=True)
-
-                # time.sleep(0.05)  # 已移除，最大化控制频率
+                    mag = "ON" if (relay and relay.is_on) else "OFF"
+                    print(f"\r实际 X={ax:+8.1f} Y={ay:+8.1f} Z={az:+8.1f}  |  "
+                          f"目标 角度={id1_target:+7.1f}° r={r_target:+7.1f}mm Z={z_target:+7.1f}mm  |  "
+                          f"J1={joints[1]:+7.1f} J2={joints[2]:+7.1f} J3={joints[3]:+7.1f} J4={joints[4]:+7.1f}"
+                          f"  |  MAG={mag}",
+                          end="", flush=True)
+                elif not dirty:
+                    time.sleep(0.005)   # 空闲时让出 CPU, 按键轮询仍保持 ~200 Hz
 
         except KeyboardInterrupt:
             print("\n用户中断")
+        finally:
+            if relay:
+                relay.close()
+                print("继电器已断开 (mag_low)")
 
 
 if __name__ == "__main__":
