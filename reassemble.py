@@ -10,6 +10,7 @@
   5. 重复直到所有碎片合并完毕，显示拼接结果
 """
 
+import math
 import numpy as np
 import cv2
 import itertools
@@ -259,8 +260,59 @@ def merge_polygons(fixed, moving_aligned, ia_fixed, ib_moving):
 #  YOLO → 多边形
 # ============================================================
 
-def masks_from_yolo(results, num_fragments=4):
-    """从 YOLOv8 推理结果中提取多边形顶点列表。"""
+def force_max_vertices(pts, max_vertices=5):
+    """
+    强制把多边形顶点数缩到 max_vertices（默认 5）。
+
+    顶点数超过 max_vertices 时，迭代删除"最平"的顶点（所接两条邻边夹角
+    最接近 0°、几乎在一条直线上的点），每次只删一个、删完重新评估，
+    尽量保持图形形状；不超过 max_vertices 时原样返回。
+    """
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    pts = [(int(round(x)), int(round(y))) for x, y in pts]
+
+    # 去重：删除相邻重复点，避免零长度边
+    cleaned = []
+    for p in pts:
+        if not cleaned or p != cleaned[-1]:
+            cleaned.append(p)
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1]:
+        cleaned.pop()
+    pts = cleaned
+
+    while len(pts) > max_vertices:
+        n = len(pts)
+        flattest = 0
+        best_angle = 181.0
+        for i in range(n):
+            px, py = pts[(i - 1) % n]
+            cx, cy = pts[i]
+            nx_, ny_ = pts[(i + 1) % n]
+            v1 = (cx - px, cy - py)
+            v2 = (nx_ - cx, ny_ - cy)
+            len1 = math.hypot(v1[0], v1[1])
+            len2 = math.hypot(v2[0], v2[1])
+            if len1 < 1e-6 or len2 < 1e-6:
+                flattest = i
+                break
+            cos_a = (v1[0] * v2[0] + v1[1] * v2[1]) / (len1 * len2)
+            cos_a = max(-1.0, min(1.0, cos_a))
+            angle = math.degrees(math.acos(cos_a))  # 0°=平直, 180°=急弯
+            if angle < best_angle:
+                best_angle = angle
+                flattest = i
+        del pts[flattest]
+
+    return pts
+
+
+def masks_from_yolo(results, num_fragments=4, epsilon=0.04):
+    """从 YOLOv8 推理结果中提取多边形顶点列表。
+
+    epsilon: 轮廓近似精度（与 infer.py 显示路径的 APPROX_EPSILON=0.04 一致，
+    避免同一 mask 在显示端和拼接端得到不同顶点数）。
+    顶点数超过 5 的多边形会被 force_max_vertices 强制缩到 5 个。
+    """
     r = results[0]
     if r.masks is None:
         return []
@@ -282,10 +334,10 @@ def masks_from_yolo(results, num_fragments=4):
 
         cnt = max(contours, key=cv2.contourArea)
         peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(cnt, epsilon * peri, True)
 
         if len(approx) >= 3:
-            polygons.append(approx)
+            polygons.append(force_max_vertices(approx))
 
     return polygons
 

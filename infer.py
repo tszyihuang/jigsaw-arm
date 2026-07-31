@@ -11,14 +11,16 @@ from datetime import datetime
 import numpy as np
 import torch
 from ultralytics import YOLO
-from reassemble import masks_from_yolo, reassemble, draw_exploded_view, create_combined_view, draw_fragments_on_original
+from reassemble import (masks_from_yolo, reassemble, draw_exploded_view,
+                        create_combined_view, draw_fragments_on_original,
+                        force_max_vertices)
 
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
 CAMERA_INDEX = 0
 WIDTH, HEIGHT = 640, 480
 FPS = 60
-CONF_THRESH = 0.5
+CONF_THRESH = 0.8
 
 WINDOW_NAME = "YOLO Seg - GPU"
 COMBINED_WINDOW_NAME = "Combined View"
@@ -29,7 +31,7 @@ VERTEX_COLOR = (0, 0, 255)  # 顶点颜色 (红色)
 VERTEX_THICKNESS = -1       # 填充圆点
 EDGE_COLOR = (0, 255, 255)  # 多边形边颜色 (黄色)
 EDGE_THICKNESS = 2
-APPROX_EPSILON = 0.03       # 轮廓近似精度（越小顶点越多，越大越简化）
+APPROX_EPSILON = 0.04       # 轮廓近似精度（越小顶点越多，越大越简化）
 
 # ===== 几何中心点配置 =====
 CENTROID_RADIUS = 3        # 中心点半径
@@ -37,7 +39,7 @@ CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
 CENTROID_THICKNESS = -1     # 填充圆点
 
 # ===== 顶点时域平滑配置 =====
-SMOOTH_ALPHA = 1         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
+SMOOTH_ALPHA = 0.3         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
 MAX_MATCH_DIST = 30        # 帧间顶点/轨迹匹配的最大距离 (像素)
 MAX_LOST_FRAMES = 10       # 目标丢失后轨迹保留的帧数
 
@@ -156,7 +158,7 @@ def mask_to_polygon_pts(mask_tensor, image_shape):
     approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
     if len(approx) < 3:
         return None
-    return [tuple(p[0]) for p in approx]
+    return force_max_vertices([tuple(p[0]) for p in approx])
 
 
 def draw_contour_polygon_vertices(image, masks_data, smoother=None, class_ids=None):
