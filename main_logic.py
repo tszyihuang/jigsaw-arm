@@ -47,14 +47,20 @@ STANDBY_Z = 60.0
 
 STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 
+# ── 基座旋转 → 舵机反向补偿 ────────────────────────────────────────────────
+# 电机1 (基座) 旋转 Δ° 后, 舵机自动反向旋转补偿, 抵消基座转动对工具姿态的
+# 影响 (保持抓取物方向不变). 方向推导: 基座角增大 = 从上方 (摄像头视角) 看
+# 顺时针 (FK 镜像约定 x=-r·cosθ1, y=r·sinθ1, 相机 +x 右 / +y 上), 而舵机
+# 正 = 逆时针, 故补偿量 = +Δ 即满足 "基座顺时针 Δ° → 舵机逆时针 Δ°".
+# 若实测补偿方向相反, 将该值改为 -1.
+SERVO_BASE_COMP_GAIN = -1.0
+
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
-ACTION_Z_DOWN = -40.0   # ① 下降到该高度
+ACTION_Z_DOWN = -41.0   # ① 下降到该高度
 ACTION_Z_UP   =   0.0   # ④ 动作结束后 Z 回升到该高度
-ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
+ACTION_WAIT_DOWN = 2.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
-ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
-ACTION_ACCEL_RPM_S = 50.0   # 梯形曲线加速度 (rpm/s, 0x26 平滑加减速)
-ACTION_DECEL_RPM_S = 50.0   # 梯形曲线减速度 (rpm/s)
+ACTION_SPEED_RPM = 6.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
 TRANS_V_OFFSET = -330.0  # 放置点 V = 抓取点 V - 480 (所有情况都减去 480)
@@ -67,6 +73,8 @@ class MainLogic:
 
     def __init__(self, esp_port=None, no_vision=False):
         self.arm = CartesianArm()          # 机械臂 + 笛卡尔控制层 (含手腕水平参考)
+        # 基座旋转 → 舵机反向补偿 (保持工具姿态; 舵机未连接时内部自动跳过)
+        self.arm.on_base_rotate = self._compensate_base_rotation
         self.no_vision = no_vision         # 调试模式: 跳过一切视觉功能
         self._model = None                 # YOLO 模型缓存 (detect_target 与 read 共用)
         esp_port = esp_port or detect_esp32_port()
@@ -95,6 +103,29 @@ class MainLogic:
         except Exception as e:
             print(f"⚠ 舵机连接失败: {e} — r 指令不可用")
             self.servo = None
+
+    # ── 基座旋转补偿 ──
+
+    def _compensate_base_rotation(self, delta_deg):
+        """基座 (ID1) 旋转后的舵机反向补偿 (arm.on_base_rotate 回调).
+
+        电机1 旋转 Δ° 时, 舵机反向旋转 Δ × SERVO_BASE_COMP_GAIN
+        (舵机正 = 逆时针), 保持工具/碎片绝对姿态不变.
+        Δ 的符号约定: 基座角增大 = 从上方看顺时针.
+        舵机未连接时警告并跳过, 不影响机械臂移动.
+        """
+        if not self.servo:
+            print(f"  ⚠ 基座旋转 {delta_deg:+.1f}°, 舵机未连接 — 跳过旋转补偿")
+            return
+        comp_deg = delta_deg * SERVO_BASE_COMP_GAIN
+        print(f"  [补偿] 基座 {delta_deg:+.1f}° → 舵机反向 {comp_deg:+.1f}°")
+        new_pos = self.servo.move_relative_deg(comp_deg,
+                                               target_speed=SERVO_SPEED)
+        if new_pos is None:
+            print("  ⚠ 舵机补偿失败 (读取当前位置失败)")
+        else:
+            print(f"  ✓ 舵机补偿 → 位置 {new_pos} "
+                  f"({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
 
     # ── 启动流程 ──
 
@@ -155,7 +186,9 @@ class MainLogic:
         输出格式: #N(原始坐标)-(爆炸图坐标, 旋转角)
         原始坐标 = 摄像头画面中碎片多边形几何中心 (像素);
         爆炸图坐标 = 爆炸图画布中该碎片位置几何中心 (像素);
-        旋转角 = 拼接对齐相对原始位姿的旋转角 (°, 顺时针为负、逆时针为正).
+        旋转角 = 拼接对齐相对原始位姿的旋转角, 输出时已取反
+                 (原始为屏幕坐标约定: 顺时针为负、逆时针为正;
+                 取反后为舵机约定: 正=逆时针, 可直接用于 trans 角度).
         """
         try:
             import infer
@@ -181,7 +214,9 @@ class MainLogic:
         for d in data:
             ox, oy = d["orig"]
             ex, ey = d["exploded"]
-            print(f"  #{d['idx'] + 1}({ox}, {oy})-({ex}, {ey}, {d['rot_deg']:+.1f}°)")
+            # 输出的旋转角取反: 原始计算为屏幕坐标系 (顺时针为负、逆时针为正),
+            # 输出时反转为舵机方向约定 (正=逆时针), 可直接用于 trans 角度
+            print(f"  #{d['idx'] + 1}({ox}, {oy})-({ex}, {ey}, {-d['rot_deg']:+.1f}°)")
 
     def run(self):
         """主逻辑入口 — 启动 → 目标识别 → 控制台控制循环."""
@@ -256,10 +291,8 @@ class MainLogic:
         *_, (tx, ty, tz) = self.arm.status()
         print(f"  [动作] 当前位置: 执行器 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
         print(f"  [动作] ① 下降到 Z={ACTION_Z_DOWN:.0f} mm "
-              f"(转速 {ACTION_SPEED_RPM:.0f} rpm, 梯形曲线)")
-        self.arm.move_tool_to(tx, ty, ACTION_Z_DOWN, speed_rpm=ACTION_SPEED_RPM,
-                              trapezoid=True, max_accel_rpm_s=ACTION_ACCEL_RPM_S,
-                              max_decel_rpm_s=ACTION_DECEL_RPM_S)
+              f"(转速 {ACTION_SPEED_RPM:.0f} rpm)")
+        self.arm.move_tool_to(tx, ty, ACTION_Z_DOWN, speed_rpm=ACTION_SPEED_RPM)
         print(f"  [动作] ② 等待 {ACTION_WAIT_DOWN:.0f}s")
         time.sleep(ACTION_WAIT_DOWN)
         name = "吸合" if mag_on else "释放"
@@ -271,10 +304,8 @@ class MainLogic:
             self.esp.relay_off()
         time.sleep(ACTION_WAIT_MAG)
         print(f"  [动作] ④ Z 回升到 {ACTION_Z_UP:.0f} mm "
-              f"(转速 {ACTION_SPEED_RPM:.0f} rpm, 梯形曲线)")
-        self.arm.move_tool_to(tx, ty, ACTION_Z_UP, speed_rpm=ACTION_SPEED_RPM,
-                              trapezoid=True, max_accel_rpm_s=ACTION_ACCEL_RPM_S,
-                              max_decel_rpm_s=ACTION_DECEL_RPM_S)
+              f"(转速 {ACTION_SPEED_RPM:.0f} rpm)")
+        self.arm.move_tool_to(tx, ty, ACTION_Z_UP, speed_rpm=ACTION_SPEED_RPM)
         print(f"  ✓ {'抓取' if mag_on else '放下'}完成")
 
     def _run_trans(self, u, v, angle_deg=None, u_place=None, v_place=None):

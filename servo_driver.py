@@ -4,7 +4,7 @@ import time
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 SERVO_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"  # 稳定 by-id 路径, 防 USB 枚举顺序变化
 SERVO_STEP_PER_DEG = 4095 / 360   # 每度对应的步数
-SERVO_SPEED = 500                 # 常用转动速度
+SERVO_SPEED = 1000                 # 常用转动速度
 
 # ================= Feetech STS/SCS 串口舵机驱动 (ID=1) =================
 class FeetechSTSServo:

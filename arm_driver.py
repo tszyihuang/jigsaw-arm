@@ -358,6 +358,7 @@ class CartesianArm:
         self.arm = Arm(port=port, baudrate=baudrate)
         self.arm.set_wrist_level_ref()    # 锚定手腕水平参考 (ID4 自动维持水平)
         self._target = None               # 当前目标极坐标状态 (待机或首次移动时初始化)
+        self.on_base_rotate = None        # 基座旋转回调 (delta_deg), 舵机反向补偿由上层注入
 
     # ── 待机 ──
 
@@ -380,17 +381,24 @@ class CartesianArm:
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
         print(f"待机目标 → 极坐标: 基座 {base_deg:.1f}°  r={r:.1f}mm  Z={z:.1f}mm")
         print(f"  关节: ID1={base_deg:.1f}°  ID2={id2:.1f}°  ID3={id3:.1f}°  ID4={id4:.1f}°")
-        if base_first:
+
+        # 当前基座角: 分段判断与舵机旋转补偿共用一次读取
+        id1_cur = float("nan")
+        if base_first or self.on_base_rotate is not None:
             try:
                 id1_cur = self.arm.get_joints()[1]
             except (KeyError, IndexError):
-                id1_cur = float("nan")
-            if math.isnan(id1_cur):
+                pass
+        delta_base = base_deg - id1_cur   # 基座旋转角增量 (°, nan = 读取失败)
+
+        if base_first:
+            if math.isnan(delta_base):
                 print("  ⚠ 读取基座当前角度失败, 退化为同步多轴移动")
-            elif abs(base_deg - id1_cur) > 0.5:
+            elif abs(delta_base) > 0.5:
                 # 回程分段步骤 (与去程相反): ① 先旋转基座 → ② 再臂平面内移动
                 print(f"  ① 基座旋转 → {base_deg:+.1f}°")
                 self.arm.move_joint(1, base_deg, speed_rpm=speed_rpm)
+                self._notify_base_rotate(delta_base)
                 if self.wait_for_arrival({1: base_deg}):
                     print("  ✓ 基座旋转到位")
                 else:
@@ -401,6 +409,7 @@ class CartesianArm:
                                   speed_rpm=speed_rpm)
                 return target
         self.arm.move_all(target, speed_rpm=speed_rpm)
+        self._notify_base_rotate(delta_base)
         return target
 
     def wait_for_arrival(self, target, tolerance=2.0, timeout=30.0):
@@ -412,6 +421,18 @@ class CartesianArm:
                 return True
             time.sleep(0.1)
         return False
+
+    def _notify_base_rotate(self, delta_deg):
+        """基座 (ID1) 旋转后的回调 — 供上层做舵机反向补偿 (保持工具绝对姿态).
+
+        仅当上层注册了 on_base_rotate 且本次旋转量 > 0.5° 时调用,
+        传入基座旋转角增量 delta_deg (°, 代码约定: 增大 = 从上方看顺时针).
+        """
+        if self.on_base_rotate is None or delta_deg is None:
+            return
+        if math.isnan(delta_deg) or abs(delta_deg) <= 0.5:
+            return
+        self.on_base_rotate(delta_deg)
 
     def go_home(self, x, y, z, wait=True, speed_rpm=10.0):
         """回到待机位置 (x, y, z) 并等待到达."""
@@ -472,16 +493,21 @@ class CartesianArm:
         self._target["base"], self._target["r"], self._target["z"] = base_deg, r, z
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
 
-        # 分段步骤: 基座无需转动 (或读取失败) 时退化为同步多轴移动
-        segmented = False
-        if base_after_plane:
+        # 当前基座角: 分段判断与舵机旋转补偿共用一次读取
+        id1_cur = float("nan")
+        if base_after_plane or self.on_base_rotate is not None:
             try:
                 id1_cur = self.arm.get_joints()[1]
             except (KeyError, IndexError):
-                id1_cur = float("nan")
-            if math.isnan(id1_cur):
+                pass
+        delta_base = base_deg - id1_cur   # 基座旋转角增量 (°, nan = 读取失败)
+
+        # 分段步骤: 基座无需转动 (或读取失败) 时退化为同步多轴移动
+        segmented = False
+        if base_after_plane:
+            if math.isnan(delta_base):
                 print("  ⚠ 读取基座当前角度失败, 退化为同步多轴移动")
-            elif abs(base_deg - id1_cur) <= 0.5:
+            elif abs(delta_base) <= 0.5:
                 segmented = False      # 基座已就位, 仅平面内移动
             else:
                 segmented = True
@@ -500,16 +526,18 @@ class CartesianArm:
                 print("  ✓ 平面移动到位")
             else:
                 print("  ⚠ 平面移动等待超时 — 仍继续执行基座旋转")
-            # ② 平面移动完成后再旋转基座 (ID1)
+            # ② 平面移动完成后再旋转基座 (ID1), 并触发舵机反向补偿
             print(f"  ② 基座旋转 → {base_deg:+.1f}°")
             self.arm.move_joint(1, base_deg, speed_rpm=speed_rpm,
                                 trapezoid=trapezoid,
                                 max_accel_rpm_s=max_accel_rpm_s,
                                 max_decel_rpm_s=max_decel_rpm_s)
+            self._notify_base_rotate(delta_base)
         else:
             self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
                               max_accel_rpm_s=max_accel_rpm_s,
                               max_decel_rpm_s=max_decel_rpm_s)
+            self._notify_base_rotate(delta_base)
 
         print(f"  目标 → 笛卡尔 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm  "
               f"(极坐标 基座 {base_deg:+.1f}°  r={r:+.1f}mm)")
