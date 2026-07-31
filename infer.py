@@ -21,6 +21,7 @@ FPS = 60
 CONF_THRESH = 0.5
 
 WINDOW_NAME = "YOLO Seg - GPU"
+COMBINED_WINDOW_NAME = "Combined View"
 
 # ===== 顶点显示配置 =====
 VERTEX_RADIUS = 4          # 顶点圆点半径
@@ -36,7 +37,7 @@ CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
 CENTROID_THICKNESS = -1     # 填充圆点
 
 # ===== 顶点时域平滑配置 =====
-SMOOTH_ALPHA = 0.4         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
+SMOOTH_ALPHA = 1         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
 MAX_MATCH_DIST = 30        # 帧间顶点/轨迹匹配的最大距离 (像素)
 MAX_LOST_FRAMES = 10       # 目标丢失后轨迹保留的帧数
 
@@ -395,14 +396,14 @@ def main():
                     # 原始帧上标注碎片
                     fragments_img = draw_fragments_on_original(clean, masks)
 
-                    # A4 横向组合窗口：左 = 爆炸图，右 = 摄像头碎片
-                    combined = create_combined_view(exploded, fragments_img)
-                    cv2.imshow("Fragments & Exploded", combined)
+                    # 三合一组合窗口：爆炸图 | 实物图 | 装配图
+                    combined = create_combined_view(exploded, fragments_img, canvas)
+                    cv2.namedWindow(COMBINED_WINDOW_NAME, cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow(COMBINED_WINDOW_NAME,
+                                     combined.shape[1], combined.shape[0])
+                    cv2.imshow(COMBINED_WINDOW_NAME, combined)
 
-                    # 装配图独立窗口
-                    cv2.imshow("Reassembly", canvas)
-
-                    print("拼接完成 — 窗口 'Reassembly' + 'Fragments & Exploded'")
+                    print("拼接完成 — 组合窗口 'Combined View' (爆炸图 | 实物图 | 装配图)")
             except Exception as e:
                 import traceback
                 traceback.print_exc()

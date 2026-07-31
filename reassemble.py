@@ -405,25 +405,41 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
     return best_result
 
 
-def draw_exploded_view(fragments, gap=0.3):
+# 爆炸图目标画布尺寸 (宽 × 高)
+EXPLODED_VIEW_W = 640
+EXPLODED_VIEW_H = 480
+
+# 几何中心点绘制配置
+CENTROID_RADIUS = 4           # 中心点半径
+CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
+CENTROID_THICKNESS = -1       # 填充圆点
+
+
+def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
     """
     绘制爆炸图：重心径向推开。
-    每个碎片沿「重心 → 碎片质心」方向向外推移，推力与距重心距离成正比。
 
-    push = direction * gap  （线性，gap 为缩放系数）
+    碎片保持实际像素大小不变（与摄像头画面 1:1，所占像素一致），
+    每个碎片沿「重心 → 碎片质心」方向向外推移，推力与距重心距离成正比。
+    若推开后的布局超出画布，自动等比缩小推力（只改变爆炸间距，不改变
+    碎片大小），布局整体居中绘制在固定尺寸画布上，并标出每个碎片的
+    几何中心坐标。
 
     Args:
         fragments: [(idx, poly), ...] 已对齐的碎片列表
         gap: 缩放系数，越大推得越开（默认 0.3）
+        canvas_size: 输出画布尺寸 (宽, 高)
 
     Returns:
-        canvas: 爆炸图图像
+        canvas: 爆炸图图像（固定 canvas_size，碎片 1:1 像素）
     """
     if len(fragments) < 2:
         return draw_result(fragments)
 
+    tw, th = canvas_size
     n = len(fragments)
-    positions = [f.copy() for _, f in fragments]
+    originals = [f.copy() for _, f in fragments]
+    positions = [f.copy() for f in originals]
 
     # 1. 计算每个碎片的质心 + 整体重心
     frag_centroids = []
@@ -436,22 +452,43 @@ def draw_exploded_view(fragments, gap=0.3):
     global_center = np.mean(frag_centroids, axis=0)
 
     # 2. 每个碎片沿径向向外推移，线性：推力 ∝ 距重心距离
+    pushes = []
     for i in range(n):
         direction = frag_centroids[i] - global_center
-        push = direction * gap
-        positions[i] = positions[i] + push
+        pushes.append(direction * gap)
+        positions[i] = originals[i] + pushes[i]
+
+    # 3. 若布局超出画布 → 等比缩小推力直到完整可见
+    #    （只改变爆炸间距，碎片像素大小保持不变）
+    avail_w, avail_h = tw - 2, th - 2
+    for _ in range(64):
+        bb_min = positions[0].min(axis=0)
+        bb_max = positions[0].max(axis=0)
+        for p in positions[1:]:
+            bb_min = np.minimum(bb_min, p.min(axis=0))
+            bb_max = np.maximum(bb_max, p.max(axis=0))
+        bw, bh = bb_max - bb_min
+        if bw <= avail_w and bh <= avail_h:
+            break
+        s = min(avail_w / max(float(bw), 1.0), avail_h / max(float(bh), 1.0))
+        if s >= 1.0:
+            break
+        for i in range(n):
+            pushes[i] = pushes[i] * s
+            positions[i] = originals[i] + pushes[i]
+
+    # 4. 布局中心对齐画布中心（纯平移，碎片大小不变）
+    bb_min = positions[0].min(axis=0)
+    bb_max = positions[0].max(axis=0)
+    for p in positions[1:]:
+        bb_min = np.minimum(bb_min, p.min(axis=0))
+        bb_max = np.maximum(bb_max, p.max(axis=0))
+    offset = np.array([(tw - (bb_max[0] - bb_min[0])) / 2 - bb_min[0],
+                       (th - (bb_max[1] - bb_min[1])) / 2 - bb_min[1]],
+                      dtype=np.float32)
 
     # ---- 绘制 ----
-    all_pts = np.vstack(positions).astype(np.int32)
-    x_min, y_min = all_pts.min(axis=0)
-    x_max, y_max = all_pts.max(axis=0)
-
-    margin = 60
-    w = x_max - x_min + 2 * margin
-    h = y_max - y_min + 2 * margin
-    offset = np.array([-x_min + margin, -y_min + margin], dtype=np.float32)
-
-    canvas = np.full((h, w, 3), 30, dtype=np.uint8)
+    canvas = np.full((th, tw, 3), 30, dtype=np.uint8)
 
     for i, (orig_idx, frag) in enumerate(fragments):
         color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
@@ -474,6 +511,11 @@ def draw_exploded_view(fragments, gap=0.3):
             cy = int(M['m01'] / M['m00'])
             cv2.putText(canvas, f"#{orig_idx + 1}", (cx - 15, cy + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # 几何中心点 + 坐标文字
+            cv2.circle(canvas, (cx, cy), CENTROID_RADIUS, CENTROID_COLOR, CENTROID_THICKNESS)
+            cv2.putText(canvas, f"({cx}, {cy})", (cx + 10, cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, CENTROID_COLOR, 1)
 
     return canvas
 
@@ -581,9 +623,9 @@ FRAGMENT_COLORS = [
     (200, 160, 80),   # 青
 ]
 
-# A4 横向窗口像素尺寸 (~96 DPI: 297×210mm)
-A4_LANDSCAPE_W = 1120
-A4_LANDSCAPE_H = 792
+# 组合视图面板尺寸（与摄像头分辨率一致，保证 1:1）
+COMBINED_PANEL_W = 640
+COMBINED_PANEL_H = 480
 
 
 def draw_result(fragments, merged=None):
@@ -678,56 +720,58 @@ def draw_fragments_on_original(image, polygons):
     return result
 
 
-def create_combined_view(exploded_img, fragment_img):
+def create_combined_view(exploded_img, fragment_img, reassembly_img=None):
     """
-    创建 A4 横向组合视图：左半 = 爆炸图，右半 = 摄像头碎片图。
+    创建组合视图：爆炸图 | 实物图 | 装配图 横向排列在一个窗口。
+
+    每个面板固定 COMBINED_PANEL_W x COMBINED_PANEL_H（640x480，与摄像头
+    分辨率一致，碎片 1:1），图像等比缩放居中放入面板（不放大，只缩小
+    过大的图像）。
 
     Args:
         exploded_img: 爆炸图 BGR 图像
-        fragment_img: 带碎片标注的原始图像
+        fragment_img: 带碎片标注的实物图（摄像头画面）
+        reassembly_img: 装配图 BGR 图像（可选，传入则显示三面板）
 
     Returns:
-        A4 横向画布 (H, W, 3) BGR
+        组合画布 (H, W, 3) BGR
     """
-    canvas = np.full((A4_LANDSCAPE_H, A4_LANDSCAPE_W, 3), 35, dtype=np.uint8)
-    half_w = A4_LANDSCAPE_W // 2
-    top_margin = 40
-    bottom_margin = 10
+    panel_w, panel_h = COMBINED_PANEL_W, COMBINED_PANEL_H
+    title_h = 40
+    divider = 2   # 面板分隔线宽度
 
-    # ---- 左半：爆炸图 ----
-    if exploded_img is not None:
-        eh, ew = exploded_img.shape[:2]
-        avail_w = half_w - 30
-        avail_h = A4_LANDSCAPE_H - top_margin - bottom_margin
-        scale = min(avail_w / ew, avail_h / eh, 1.0)
-        new_w = int(ew * scale)
-        new_h = int(eh * scale)
-        resized = cv2.resize(exploded_img, (new_w, new_h))
-        x_offset = (half_w - new_w) // 2
-        y_offset = top_margin + (avail_h - new_h) // 2
-        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    images = [exploded_img, fragment_img]
+    titles = ["Exploded View", "Camera / Fragments"]
+    if reassembly_img is not None:
+        images.append(reassembly_img)
+        titles.append("Reassembly")
 
-    # ---- 右半：摄像头碎片 ----
-    if fragment_img is not None:
-        fh, fw = fragment_img.shape[:2]
-        avail_w = half_w - 30
-        avail_h = A4_LANDSCAPE_H - top_margin - bottom_margin
-        scale = min(avail_w / fw, avail_h / fh, 1.0)
-        new_w = int(fw * scale)
-        new_h = int(fh * scale)
-        resized = cv2.resize(fragment_img, (new_w, new_h))
-        x_offset = half_w + (half_w - new_w) // 2
-        y_offset = top_margin + (avail_h - new_h) // 2
-        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    n = len(images)
+    canvas_w = n * panel_w + (n - 1) * divider
+    canvas_h = title_h + panel_h
+    canvas = np.full((canvas_h, canvas_w, 3), 35, dtype=np.uint8)
 
-    # ---- 标题 ----
-    cv2.putText(canvas, "Exploded View", (20, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-    cv2.putText(canvas, "Camera / Fragments", (half_w + 20, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+    for i, (img, title) in enumerate(zip(images, titles)):
+        x0 = i * (panel_w + divider)
+        if img is not None:
+            ih, iw = img.shape[:2]
+            scale = min(panel_w / iw, panel_h / ih, 1.0)   # 不放大，只缩小
+            new_w = max(int(iw * scale), 1)
+            new_h = max(int(ih * scale), 1)
+            if (new_w, new_h) != (iw, ih):
+                img = cv2.resize(img, (new_w, new_h),
+                                 interpolation=cv2.INTER_AREA)
+            x = x0 + (panel_w - new_w) // 2
+            y = title_h + (panel_h - new_h) // 2
+            canvas[y:y + new_h, x:x + new_w] = img
 
-    # ---- 分隔线 ----
-    cv2.line(canvas, (half_w, 5), (half_w, A4_LANDSCAPE_H - 5), (80, 80, 80), 1)
+        cv2.putText(canvas, title, (x0 + 20, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+
+    # ---- 面板分隔线（画在面板之间的空隙正中间，不覆盖面板内容） ----
+    for i in range(1, n):
+        x = i * (panel_w + divider) - divider // 2
+        cv2.line(canvas, (x, title_h), (x, canvas_h - 1), (80, 80, 80), 1)
 
     return canvas
 
@@ -766,12 +810,9 @@ def main():
         # 原始图像上标注碎片
         fragments_img = draw_fragments_on_original(img, polygons)
 
-        # A4 横向组合窗口：左 = 爆炸图，右 = 摄像头碎片
-        combined = create_combined_view(exploded, fragments_img)
-        cv2.imshow("Fragments & Exploded", combined)
-
-        # 装配图独立窗口
-        cv2.imshow("Reassembly", canvas)
+        # 三合一组合窗口：爆炸图 | 实物图 | 装配图
+        combined = create_combined_view(exploded, fragments_img, canvas)
+        cv2.imshow("Combined View", combined)
 
         cv2.waitKey(0)
         if not cv2.imwrite("reassembled.jpg", canvas):
