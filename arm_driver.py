@@ -361,8 +361,13 @@ class CartesianArm:
 
     # ── 待机 ──
 
-    def go_standby(self, x, y, z, speed_rpm=10.0):
+    def go_standby(self, x, y, z, speed_rpm=10.0, base_first=True):
         """移动到待机位置 (笛卡尔 X, Y, Z) 并更新目标状态.
+
+        回程 (home/待机) 分段步骤与 move_to_cartesian 去程方向相反:
+        base_first=True (默认) 时 ① 先旋转基座 (ID1) 到位, 等待完成后再
+        ② 臂平面内移动 (ID2/ID3/ID4) 回到待机 r/Z — 回程先对齐方位再收臂.
+        目标基座角与当前角相差 ≤ 0.5° 或读取失败时退化为同步多轴移动.
 
         Returns:
             target: 目标关节角 {1..4: deg}, 供 wait_for_arrival 使用
@@ -375,6 +380,26 @@ class CartesianArm:
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
         print(f"待机目标 → 极坐标: 基座 {base_deg:.1f}°  r={r:.1f}mm  Z={z:.1f}mm")
         print(f"  关节: ID1={base_deg:.1f}°  ID2={id2:.1f}°  ID3={id3:.1f}°  ID4={id4:.1f}°")
+        if base_first:
+            try:
+                id1_cur = self.arm.get_joints()[1]
+            except (KeyError, IndexError):
+                id1_cur = float("nan")
+            if math.isnan(id1_cur):
+                print("  ⚠ 读取基座当前角度失败, 退化为同步多轴移动")
+            elif abs(base_deg - id1_cur) > 0.5:
+                # 回程分段步骤 (与去程相反): ① 先旋转基座 → ② 再臂平面内移动
+                print(f"  ① 基座旋转 → {base_deg:+.1f}°")
+                self.arm.move_joint(1, base_deg, speed_rpm=speed_rpm)
+                if self.wait_for_arrival({1: base_deg}):
+                    print("  ✓ 基座旋转到位")
+                else:
+                    print("  ⚠ 基座旋转等待超时 — 仍继续执行平面移动")
+                print(f"  ② 臂平面内移动 → r={r:.1f}mm  Z={z:.1f}mm "
+                      f"(基座 {base_deg:+.1f}°)")
+                self.arm.move_all({2: id2, 3: id3, 4: id4},
+                                  speed_rpm=speed_rpm)
+                return target
         self.arm.move_all(target, speed_rpm=speed_rpm)
         return target
 
@@ -402,19 +427,26 @@ class CartesianArm:
 
     def move_to_cartesian(self, x, y, z=None, wait=True, speed_rpm=10.0,
                           trapezoid=False, max_accel_rpm_s=200.0,
-                          max_decel_rpm_s=200.0):
+                          max_decel_rpm_s=200.0, base_after_plane=True):
         """移动到腕部绝对笛卡尔坐标 (X, Y, Z).
 
         内部转换为极坐标 (基座角 θ1, 前伸 r) 后 IK 求解移动 (r<0 约定):
             r = -√(x²+y²),  θ1 = atan2(y, x)
 
+        base_after_plane=True (默认) 时采用分段步骤:
+            ① 先在机械臂所在平面内移动 (ID2/ID3/ID4, 基座角保持当前值),
+               等待到位后再 ② 执行基座旋转 (ID1) 到目标角度.
+            目标基座角与当前角相差 < 0.5° 或当前基座角读取失败时,
+            退化为同步多轴移动 (保持原行为).
+
         Args:
             x, y: 腕部笛卡尔水平坐标 (mm)
             z:    Z 高度 (mm), None 时保持当前 Z
-            wait: 是否等待到达 (超时 15s)
+            wait: 是否等待全部到达 (超时 15s)
             speed_rpm: 电机转速
             trapezoid: 使用梯形曲线 (0x26) 平滑加减速, 适合低速运动
             max_accel_rpm_s / max_decel_rpm_s: 梯形曲线加减速度 (rpm/s)
+            base_after_plane: 分段移动 (先臂平面, 到位后再旋转基座)
 
         Returns:
             target: 目标关节角 {1..4: deg}; 超出限位 / IK 无解时返回 None (未移动)
@@ -439,9 +471,45 @@ class CartesianArm:
 
         self._target["base"], self._target["r"], self._target["z"] = base_deg, r, z
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
-        self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
-                          max_accel_rpm_s=max_accel_rpm_s,
-                          max_decel_rpm_s=max_decel_rpm_s)
+
+        # 分段步骤: 基座无需转动 (或读取失败) 时退化为同步多轴移动
+        segmented = False
+        if base_after_plane:
+            try:
+                id1_cur = self.arm.get_joints()[1]
+            except (KeyError, IndexError):
+                id1_cur = float("nan")
+            if math.isnan(id1_cur):
+                print("  ⚠ 读取基座当前角度失败, 退化为同步多轴移动")
+            elif abs(base_deg - id1_cur) <= 0.5:
+                segmented = False      # 基座已就位, 仅平面内移动
+            else:
+                segmented = True
+
+        if segmented:
+            # ① 臂平面内移动 (ID2/ID3/ID4), 基座保持当前角度
+            plane_target = {2: id2, 3: id3, 4: id4}
+            print(f"  ① 臂平面内移动 → r={r:+.1f}mm  Z={z:+.1f}mm "
+                  f"(基座保持 {id1_cur:+.1f}°)")
+            print(f"    关节: ID2={id2:.1f}°  ID3={id3:.1f}°  ID4={id4:.1f}°")
+            self.arm.move_all(plane_target, speed_rpm=speed_rpm,
+                              trapezoid=trapezoid,
+                              max_accel_rpm_s=max_accel_rpm_s,
+                              max_decel_rpm_s=max_decel_rpm_s)
+            if self.wait_for_arrival(plane_target):
+                print("  ✓ 平面移动到位")
+            else:
+                print("  ⚠ 平面移动等待超时 — 仍继续执行基座旋转")
+            # ② 平面移动完成后再旋转基座 (ID1)
+            print(f"  ② 基座旋转 → {base_deg:+.1f}°")
+            self.arm.move_joint(1, base_deg, speed_rpm=speed_rpm,
+                                trapezoid=trapezoid,
+                                max_accel_rpm_s=max_accel_rpm_s,
+                                max_decel_rpm_s=max_decel_rpm_s)
+        else:
+            self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
+                              max_accel_rpm_s=max_accel_rpm_s,
+                              max_decel_rpm_s=max_decel_rpm_s)
 
         print(f"  目标 → 笛卡尔 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm  "
               f"(极坐标 基座 {base_deg:+.1f}°  r={r:+.1f}mm)")

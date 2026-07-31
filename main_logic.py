@@ -43,7 +43,7 @@ from servo_driver import (FeetechSTSServo, SERVO_PORT,
 # ── 待机位置 (实际笛卡尔坐标, mm) ───────────────────────────────────────────
 STANDBY_X = -9.0
 STANDBY_Y = 0.0
-STANDBY_Z = 80.0
+STANDBY_Z = 60.0
 
 STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 
