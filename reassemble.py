@@ -581,6 +581,10 @@ FRAGMENT_COLORS = [
     (200, 160, 80),   # 青
 ]
 
+# A4 横向窗口像素尺寸 (~96 DPI: 297×210mm)
+A4_LANDSCAPE_W = 1120
+A4_LANDSCAPE_H = 792
+
 
 def draw_result(fragments, merged=None):
     """
@@ -635,6 +639,99 @@ def draw_result(fragments, merged=None):
     return canvas
 
 
+def draw_fragments_on_original(image, polygons):
+    """
+    在原始图像上绘制检测到的碎片轮廓、顶点和编号。
+
+    Args:
+        image: 原始 BGR 图像
+        polygons: 多边形列表 [(N,1,2) 或 (N,2)]
+
+    Returns:
+        带标注的图像副本
+    """
+    result = image.copy()
+    for i, poly in enumerate(polygons):
+        color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
+        pts = np.asarray(poly, dtype=np.int32).reshape(-1, 1, 2)
+
+        # 半透明填充
+        overlay = result.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.25, result, 0.75, 0, result)
+
+        # 轮廓
+        cv2.polylines(result, [pts], True, color, 3)
+
+        # 顶点
+        for pt in pts:
+            cv2.circle(result, tuple(pt[0]), 4, (0, 0, 255), -1)
+
+        # 编号
+        M = cv2.moments(pts.astype(np.float32))
+        if M['m00'] > 0:
+            cx = int(M['m10'] / M['m00'])
+            cy = int(M['m01'] / M['m00'])
+            cv2.putText(result, f"#{i + 1}", (cx - 15, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    return result
+
+
+def create_combined_view(exploded_img, fragment_img):
+    """
+    创建 A4 横向组合视图：左半 = 爆炸图，右半 = 摄像头碎片图。
+
+    Args:
+        exploded_img: 爆炸图 BGR 图像
+        fragment_img: 带碎片标注的原始图像
+
+    Returns:
+        A4 横向画布 (H, W, 3) BGR
+    """
+    canvas = np.full((A4_LANDSCAPE_H, A4_LANDSCAPE_W, 3), 35, dtype=np.uint8)
+    half_w = A4_LANDSCAPE_W // 2
+    top_margin = 40
+    bottom_margin = 10
+
+    # ---- 左半：爆炸图 ----
+    if exploded_img is not None:
+        eh, ew = exploded_img.shape[:2]
+        avail_w = half_w - 30
+        avail_h = A4_LANDSCAPE_H - top_margin - bottom_margin
+        scale = min(avail_w / ew, avail_h / eh, 1.0)
+        new_w = int(ew * scale)
+        new_h = int(eh * scale)
+        resized = cv2.resize(exploded_img, (new_w, new_h))
+        x_offset = (half_w - new_w) // 2
+        y_offset = top_margin + (avail_h - new_h) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+    # ---- 右半：摄像头碎片 ----
+    if fragment_img is not None:
+        fh, fw = fragment_img.shape[:2]
+        avail_w = half_w - 30
+        avail_h = A4_LANDSCAPE_H - top_margin - bottom_margin
+        scale = min(avail_w / fw, avail_h / fh, 1.0)
+        new_w = int(fw * scale)
+        new_h = int(fh * scale)
+        resized = cv2.resize(fragment_img, (new_w, new_h))
+        x_offset = half_w + (half_w - new_w) // 2
+        y_offset = top_margin + (avail_h - new_h) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+    # ---- 标题 ----
+    cv2.putText(canvas, "Exploded View", (20, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+    cv2.putText(canvas, "Camera / Fragments", (half_w + 20, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
+
+    # ---- 分隔线 ----
+    cv2.line(canvas, (half_w, 5), (half_w, A4_LANDSCAPE_H - 5), (80, 80, 80), 1)
+
+    return canvas
+
+
 # ============================================================
 #  命令行入口
 # ============================================================
@@ -663,11 +760,18 @@ def main():
 
         canvas, _, display_frags, edge_matches = reassemble(polygons)
 
-        cv2.imshow("Reassembly", canvas)
-
-        # 爆炸图：逐个与固定碎片分离，保持固定间距
+        # 爆炸图
         exploded = draw_exploded_view(display_frags)
-        cv2.imshow("Exploded View", exploded)
+
+        # 原始图像上标注碎片
+        fragments_img = draw_fragments_on_original(img, polygons)
+
+        # A4 横向组合窗口：左 = 爆炸图，右 = 摄像头碎片
+        combined = create_combined_view(exploded, fragments_img)
+        cv2.imshow("Fragments & Exploded", combined)
+
+        # 装配图独立窗口
+        cv2.imshow("Reassembly", canvas)
 
         cv2.waitKey(0)
         if not cv2.imwrite("reassembled.jpg", canvas):

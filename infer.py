@@ -10,7 +10,7 @@ from datetime import datetime
 import numpy as np
 import torch
 from ultralytics import YOLO
-from reassemble import masks_from_yolo, reassemble
+from reassemble import masks_from_yolo, reassemble, draw_exploded_view, create_combined_view, draw_fragments_on_original
 
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
@@ -214,14 +214,21 @@ def main():
                     print(f"需要至少 2 个碎片，当前仅检测到 {len(masks)} 个")
                 else:
                     canvas, _, display_frags, edge_matches = reassemble(masks)
-                    cv2.imshow("Reassembled", canvas)
 
-                    # 爆炸图：逐个与固定碎片分离
-                    from reassemble import draw_exploded_view
+                    # 爆炸图
                     exploded = draw_exploded_view(display_frags)
-                    cv2.imshow("Exploded View", exploded)
 
-                    print("拼接完成 — 窗口 'Reassembled' + 'Exploded View'")
+                    # 原始帧上标注碎片
+                    fragments_img = draw_fragments_on_original(clean, masks)
+
+                    # A4 横向组合窗口：左 = 爆炸图，右 = 摄像头碎片
+                    combined = create_combined_view(exploded, fragments_img)
+                    cv2.imshow("Fragments & Exploded", combined)
+
+                    # 装配图独立窗口
+                    cv2.imshow("Reassembly", canvas)
+
+                    print("拼接完成 — 窗口 'Reassembly' + 'Fragments & Exploded'")
             except Exception as e:
                 import traceback
                 traceback.print_exc()
