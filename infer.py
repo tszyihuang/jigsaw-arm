@@ -213,9 +213,15 @@ def main():
                 if len(masks) < 2:
                     print(f"需要至少 2 个碎片，当前仅检测到 {len(masks)} 个")
                 else:
-                    canvas, _ = reassemble(masks)
+                    canvas, _, display_frags, edge_matches = reassemble(masks)
                     cv2.imshow("Reassembled", canvas)
-                    print("拼接完成 — 窗口 'Reassembled'")
+
+                    # 爆炸图：逐个与固定碎片分离
+                    from reassemble import draw_exploded_view
+                    exploded = draw_exploded_view(display_frags)
+                    cv2.imshow("Exploded View", exploded)
+
+                    print("拼接完成 — 窗口 'Reassembled' + 'Exploded View'")
             except Exception as e:
                 import traceback
                 traceback.print_exc()

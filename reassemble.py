@@ -294,7 +294,7 @@ def masks_from_yolo(results, num_fragments=4):
 #  拼接核心
 # ============================================================
 
-def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
+def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_order,
                area_threshold, target_vertices,
                frag_edges_cache=None, global_best=None):
     """
@@ -306,7 +306,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
       - >  target_vertices → 回溯，尝试其他边对组合
 
     Returns:
-        (merged_poly, display_frags) — 找到的解（最优优先返回 4 顶点）
+        (merged_poly, display_frags, edge_matches) — 找到的解（最优优先返回 4 顶点）
         None — 该分支无合法解
     """
     if not remaining_order:
@@ -314,7 +314,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
         nv = len(merged_poly)
         if global_best is not None and nv < global_best[0]:
             global_best[0] = nv
-        return (merged_poly.copy(), [(idx, f.copy()) for idx, f in display_frags])
+        return (merged_poly.copy(), [(idx, f.copy()) for idx, f in display_frags], list(edge_matches))
 
     orig_idx = remaining_order[0]
     rest = remaining_order[1:]
@@ -341,7 +341,7 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     scored_pairs.sort(key=lambda x: x[0], reverse=True)
 
     # ---- 依次尝试每条边对（DFS 回溯） ----
-    best_result = None
+    best_result = None   # (merged_poly, display_frags, edge_matches)
     best_verts = float('inf')
 
     # 预计算已放置碎片的面积（内层循环中不变）
@@ -377,13 +377,14 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
 
         # 递归放置剩余碎片
         new_display = display_frags + [(orig_idx, poly_aligned)]
-        result = _dfs_place(polygons, candidate_merged, new_display, rest,
+        new_edge_matches = edge_matches + [(mp1.copy(), mp2.copy())]
+        result = _dfs_place(polygons, candidate_merged, new_display, new_edge_matches, rest,
                             area_threshold, target_vertices,
                             frag_edges_cache=frag_edges_cache,
                             global_best=global_best)
 
         if result is not None:
-            mp, df = result
+            mp, df, em = result
             nv = len(mp)
             if nv == target_vertices:
                 if _check_quadrilateral_angles(mp):
@@ -404,6 +405,79 @@ def _dfs_place(polygons, merged_poly, display_frags, remaining_order,
     return best_result
 
 
+def draw_exploded_view(fragments, gap=0.3):
+    """
+    绘制爆炸图：重心径向推开。
+    每个碎片沿「重心 → 碎片质心」方向向外推移，推力与距重心距离成正比。
+
+    push = direction * gap  （线性，gap 为缩放系数）
+
+    Args:
+        fragments: [(idx, poly), ...] 已对齐的碎片列表
+        gap: 缩放系数，越大推得越开（默认 0.3）
+
+    Returns:
+        canvas: 爆炸图图像
+    """
+    if len(fragments) < 2:
+        return draw_result(fragments)
+
+    n = len(fragments)
+    positions = [f.copy() for _, f in fragments]
+
+    # 1. 计算每个碎片的质心 + 整体重心
+    frag_centroids = []
+    for poly in positions:
+        M = cv2.moments(poly.astype(np.float32))
+        if M['m00'] > 0:
+            frag_centroids.append(np.array([M['m10'] / M['m00'], M['m01'] / M['m00']], dtype=np.float32))
+        else:
+            frag_centroids.append(poly.mean(axis=0))
+    global_center = np.mean(frag_centroids, axis=0)
+
+    # 2. 每个碎片沿径向向外推移，线性：推力 ∝ 距重心距离
+    for i in range(n):
+        direction = frag_centroids[i] - global_center
+        push = direction * gap
+        positions[i] = positions[i] + push
+
+    # ---- 绘制 ----
+    all_pts = np.vstack(positions).astype(np.int32)
+    x_min, y_min = all_pts.min(axis=0)
+    x_max, y_max = all_pts.max(axis=0)
+
+    margin = 60
+    w = x_max - x_min + 2 * margin
+    h = y_max - y_min + 2 * margin
+    offset = np.array([-x_min + margin, -y_min + margin], dtype=np.float32)
+
+    canvas = np.full((h, w, 3), 30, dtype=np.uint8)
+
+    for i, (orig_idx, frag) in enumerate(fragments):
+        color = FRAGMENT_COLORS[i % len(FRAGMENT_COLORS)]
+        thickness = 3 if i == 0 else 2
+
+        frag_s = (positions[i] + offset).astype(np.int32)
+
+        # 半透明填充
+        overlay = canvas.copy()
+        cv2.fillPoly(overlay, [frag_s], color)
+        cv2.addWeighted(overlay, 0.4, canvas, 0.6, 0, canvas)
+
+        # 轮廓
+        cv2.polylines(canvas, [frag_s], True, color, thickness)
+
+        # 编号
+        M = cv2.moments(frag_s.astype(np.float32))
+        if M['m00'] > 0:
+            cx = int(M['m10'] / M['m00'])
+            cy = int(M['m01'] / M['m00'])
+            cv2.putText(canvas, f"#{orig_idx + 1}", (cx - 15, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    return canvas
+
+
 def reassemble(masks, area_threshold=0.92, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
@@ -422,7 +496,7 @@ def reassemble(masks, area_threshold=0.92, target_vertices=4):
         target_vertices: 目标顶点数（默认 4，即四边形）
 
     Returns:
-        (canvas, [merged_poly])
+        (canvas, [merged_poly], display_frags, edge_matches)
     """
     if len(masks) < 2:
         raise ValueError(f"需要至少 2 个碎片，当前仅有 {len(masks)} 个")
@@ -451,20 +525,21 @@ def reassemble(masks, area_threshold=0.92, target_vertices=4):
 
             merged_poly = polygons[fixed_idx].copy()
             display_frags = [(fixed_idx, polygons[fixed_idx].copy())]
+            edge_matches = [None]  # 固定碎片没有匹配边
 
-            result = _dfs_place(polygons, merged_poly, display_frags, perm,
+            result = _dfs_place(polygons, merged_poly, display_frags, edge_matches, perm,
                                 area_threshold, target_vertices,
                                 frag_edges_cache=frag_edges_cache,
                                 global_best=global_best)
 
             if result is not None:
-                mp, df = result
+                mp, df, em = result
                 nv = len(mp)
                 if nv == target_vertices and _check_quadrilateral_angles(mp):
                     elapsed = time.time() - start_time
                     print(f"✓ 拼接成功: {nv} 顶点 (四角均 ≈90°), 耗时 {elapsed:.1f}s")
                     canvas = draw_result(df, mp)
-                    return canvas, [mp]
+                    return canvas, [mp], df, em
                 if nv < best_verts:
                     best_verts = nv
                     best_result = result
@@ -473,7 +548,7 @@ def reassemble(masks, area_threshold=0.92, target_vertices=4):
 
     # ---- 回退：返回最接近目标顶点数的结果 ----
     if best_result is not None:
-        mp, df = best_result
+        mp, df, em = best_result
         elapsed = time.time() - start_time
         nv = len(mp)
 
@@ -488,7 +563,7 @@ def reassemble(masks, area_threshold=0.92, target_vertices=4):
             print(f"△ 部分成功: {nv} 顶点 (未达目标 {target_vertices}), 耗时 {elapsed:.1f}s")
 
         canvas = draw_result(df, mp)
-        return canvas, [mp]
+        return canvas, [mp], df, em
 
     elapsed = time.time() - start_time
     raise ValueError(f"✗ 拼接失败: 无合法方案, 耗时 {elapsed:.1f}s")
@@ -586,14 +661,23 @@ def main():
             print(f"仅检测到 {len(polygons)} 个碎片（需要 ≥2）")
             sys.exit(1)
 
-        canvas, _ = reassemble(polygons)
+        canvas, _, display_frags, edge_matches = reassemble(polygons)
 
         cv2.imshow("Reassembly", canvas)
+
+        # 爆炸图：逐个与固定碎片分离，保持固定间距
+        exploded = draw_exploded_view(display_frags)
+        cv2.imshow("Exploded View", exploded)
+
         cv2.waitKey(0)
         if not cv2.imwrite("reassembled.jpg", canvas):
             print("警告: 保存 reassembled.jpg 失败（磁盘满或权限不足）")
         else:
             print("已保存: reassembled.jpg")
+        if not cv2.imwrite("exploded.jpg", exploded):
+            print("警告: 保存 exploded.jpg 失败（磁盘满或权限不足）")
+        else:
+            print("已保存: exploded.jpg")
     except ValueError as e:
         print(f"错误: {e}")
         sys.exit(1)
