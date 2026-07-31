@@ -57,8 +57,8 @@ SERVO_BASE_COMP_GAIN = -1.0
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
 ACTION_Z_DOWN = -41.0   # ① 下降到该高度
-ACTION_Z_UP   =   0.0   # ④ 动作结束后 Z 回升到该高度
-ACTION_WAIT_DOWN = 2.0  # ② 到位后等待 (s)
+ACTION_Z_UP   =   -20.0   # ④ 动作结束后 Z 回升到该高度
+ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
 ACTION_SPEED_RPM = 6.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
 
@@ -347,7 +347,11 @@ class MainLogic:
                 else:
                     print(f"  ✓ 舵机 → 新位置 {new_pos} "
                           f"({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
-            time.sleep(TRANS_WAIT)
+                    # 阻塞等待舵机到位 (替代固定延时, 到位才继续放下)
+                    if self.servo.wait_for_arrival(new_pos):
+                        print("  ✓ 舵机到位")
+                    else:
+                        print("  ⚠ 舵机旋转等待超时 — 继续放下")
         step += 1
         print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 放下 (put)")
         self._run_action(mag_on=False)
@@ -422,6 +426,11 @@ class MainLogic:
             else:
                 print(f"  ✓ 舵机 {delta_deg:+.0f}° → "
                       f"新位置 {new_pos} ({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
+                # 阻塞等待舵机到位
+                if self.servo.wait_for_arrival(new_pos):
+                    print("  ✓ 舵机到位")
+                else:
+                    print("  ⚠ 舵机旋转等待超时")
             return
         if parts[0] in ("n", "cam"):
             try:

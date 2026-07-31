@@ -95,6 +95,27 @@ class FeetechSTSServo:
         self.move_to(new_pos, target_speed=target_speed)
         return new_pos
 
+    def wait_for_arrival(self, target_position, tolerance=6, timeout=8.0):
+        """阻塞等待舵机到达目标位置 (0-4095), 轮询读取位置直到到位.
+
+        move_relative_deg 只是发送指令不等待, 本方法用于把旋转变成阻塞式:
+        Args:
+            target_position: 目标位置 (move_relative_deg 的返回值)
+            tolerance: 位置容差 (步, 4095 步 = 360°, 6 步 ≈ 0.53°)
+            timeout: 超时 (s), 超时返回 False (不抛异常, 由调用方决定后续)
+        Returns:
+            True 已到位; False 超时 / 持续读取失败.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pos, _ = self.read_position()
+            if pos is not None:
+                delta = (pos - target_position + 2048) % 4096 - 2048
+                if abs(delta) <= tolerance:
+                    return True
+            time.sleep(0.02)
+        return False
+
     def set_torque_limit(self, torque_value):
         """扭矩限制, 0-1000"""
         if not self.is_open:
