@@ -468,7 +468,7 @@ EXPLODED_VIEW_W = 640
 EXPLODED_VIEW_H = 480
 
 
-def _exploded_layout(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
+def _exploded_layout(fragments, gap=0.3, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
     """
     计算爆炸图布局：每个碎片沿「重心 → 碎片质心」方向径向推开。
 
