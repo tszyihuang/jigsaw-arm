@@ -11,7 +11,10 @@
        n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
        action             下降到 Z_DOWN → 继电器吸合 → Z 回升到 0 (抓取)
        put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
-       trans <u> <v>      搬运: n <u> <v> 0 → action → n <u> <v+V_OFFSET> 0 → put
+       trans <u> <v> [角度]  搬运: 抓取点 → 抓取 → 放置点 → [舵机旋转角度] → 放下
+                       (角度可选, 放置点放下前旋转, 正=逆时针, 如: trans 123 85 +60)
+       transport <u1> <v1> <u2> <v2> [角度]  同 trans, 但放置点显式指定
+                       (V2 仍自动 -330, 如: transport 200 200 300 300 +60 → 放置点 300, -30)
        r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
        read               跑一遍装配流程 (等价于 infer.py 按 R 键),
                           输出 #N(原始坐标)-(爆炸图坐标, 旋转角) 碎片数据
@@ -56,6 +59,7 @@ ACTION_DECEL_RPM_S = 50.0   # 梯形曲线减速度 (rpm/s)
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
 TRANS_V_OFFSET = -330.0  # 放置点 V = 抓取点 V - 480 (所有情况都减去 480)
 TRANS_WAIT     = 1.0     # 各步骤之间的等待时间 (s)
+TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤")   # 序列步骤圈号 (最多 5 步)
 
 
 class MainLogic:
@@ -221,7 +225,10 @@ class MainLogic:
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
         print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
-        print(f"           trans <u> <v>      → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → 放下")
+        print(f"           trans <u> <v> [角度] → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → [舵机旋转角度] → 放下")
+        print("                       角度可选 (放置点放下前旋转, 正=逆时针), 例如: trans 300 200 +60")
+        print(f"           transport <u1> <v1> <u2> <v2> [角度] → 同 trans, 但放置点显式指定 (V2 仍 {TRANS_V_OFFSET:+.0f})")
+        print("                       例如: transport 200 200 300 300 +60 → 放置点 (300, -30)")
         print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
         print("           read               → 跑一遍装配流程 (等价于 infer.py 按 R), 输出 #N(原始坐标)-(爆炸图坐标, 旋转角)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
@@ -270,24 +277,50 @@ class MainLogic:
                               max_decel_rpm_s=ACTION_DECEL_RPM_S)
         print(f"  ✓ {'抓取' if mag_on else '放下'}完成")
 
-    def _run_trans(self, u, v):
-        """trans 搬运序列: 移动到抓取点 → 抓取 → 移动到放置点 → 放下.
+    def _run_trans(self, u, v, angle_deg=None, u_place=None, v_place=None):
+        """trans / transport 搬运序列: 移动到抓取点 → 抓取 → 移动到放置点 → [舵机旋转] → 放下.
 
-        u/v 为相机像素坐标; 放置点 V = 抓取点 V + TRANS_V_OFFSET,
+        u/v 为抓取点相机像素坐标; 放置点缺省取 (u, v + TRANS_V_OFFSET)
+        (trans 行为). transport 变体显式指定放置点 (u_place, v_place),
+        其 V 仍应用 TRANS_V_OFFSET 偏移 (实际位置 = v_place + TRANS_V_OFFSET),
+        例如 transport 200 200 300 300 +60 → 放置点 (300, -30).
         各步骤之间等待 TRANS_WAIT 秒.
+
+        angle_deg 非 None 时, 在移动到放置点后、放下前让舵机相对转动
+        该角度 (在放置点旋转碎片, 正=逆时针), 例如 trans 300 200 +60.
+        舵机未连接时警告并跳过旋转, 搬运流程继续.
         """
+        u_place = u if u_place is None else u_place
+        v_place = (v if v_place is None else v_place) + TRANS_V_OFFSET
         print(f"  [trans] ① 移动到抓取点: n {u:.0f} {v:.0f} 0")
         self.arm.move_camera_to(u, v, 0.0)
         time.sleep(TRANS_WAIT)
         print("  [trans] ② 抓取 (action)")
         self._run_action(mag_on=True)
         time.sleep(TRANS_WAIT)
-        v_place = v + TRANS_V_OFFSET
-        print(f"  [trans] ③ 移动到放置点: n {u:.0f} {v_place:.0f} 0  "
-              f"(V{TRANS_V_OFFSET:+.0f})")
-        self.arm.move_camera_to(u, v_place, 0.0)
+        step = 2
+        step += 1
+        print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 移动到放置点: "
+              f"n {u_place:.0f} {v_place:.0f} 0  (V{TRANS_V_OFFSET:+.0f})")
+        self.arm.move_camera_to(u_place, v_place, 0.0)
         time.sleep(TRANS_WAIT)
-        print("  [trans] ④ 放下 (put)")
+        if angle_deg is not None:
+            step += 1
+            if not self.servo:
+                print(f"  ⚠ 舵机未连接, 跳过旋转 {angle_deg:+.0f}°")
+            else:
+                print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 舵机旋转 "
+                      f"{angle_deg:+.0f}° (放置点, 放下前旋转碎片)")
+                new_pos = self.servo.move_relative_deg(
+                    angle_deg, target_speed=SERVO_SPEED)
+                if new_pos is None:
+                    print("  ⚠ 读取舵机当前位置失败, 未旋转")
+                else:
+                    print(f"  ✓ 舵机 → 新位置 {new_pos} "
+                          f"({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
+            time.sleep(TRANS_WAIT)
+        step += 1
+        print(f"  [trans] {TRANS_STEP_NUMS[step - 1]} 放下 (put)")
         self._run_action(mag_on=False)
         print("  ✓ trans 搬运完成")
 
@@ -311,12 +344,32 @@ class MainLogic:
             try:
                 vals = [float(p) for p in parts[1:]]
             except ValueError:
-                print("  ⚠ 格式错误, 请输入: trans <u> <v>  例如: trans 123 85")
+                print("  ⚠ 格式错误, 请输入: trans <u> <v> [角度]  例如: trans 123 85 或 trans 123 85 +60")
                 return
-            if len(vals) != 2:
-                print("  ⚠ 需要两个参数 (相机像素坐标): trans <u> <v>  例如: trans 123 85")
+            if len(vals) < 2:
+                print("  ⚠ 至少需要 U 和 V: trans <u> <v> [角度]  例如: trans 123 85")
                 return
-            self._run_trans(vals[0], vals[1])
+            if len(vals) > 3:
+                print("  ⚠ 参数过多, 最多 3 个: trans <u> <v> [角度]  例如: trans 123 85 +60")
+                return
+            angle = vals[2] if len(vals) > 2 else None
+            self._run_trans(vals[0], vals[1], angle)
+            return
+        if parts[0] in ("transport", "transp"):
+            try:
+                vals = [float(p) for p in parts[1:]]
+            except ValueError:
+                print("  ⚠ 格式错误, 请输入: transport <u1> <v1> <u2> <v2> [角度]  例如: transport 200 200 300 300 +60")
+                return
+            if len(vals) < 4:
+                print("  ⚠ 至少需要 4 个参数: transport <u1> <v1> <u2> <v2> [角度]  例如: transport 200 200 300 300 +60")
+                return
+            if len(vals) > 5:
+                print("  ⚠ 参数过多, 最多 5 个: transport <u1> <v1> <u2> <v2> [角度]")
+                return
+            angle = vals[4] if len(vals) > 4 else None
+            # 放置点 (u2, v2): V 仍自动 -330 → 实际移动到 (u2, v2-330)
+            self._run_trans(vals[0], vals[1], angle, vals[2], vals[3])
             return
         if parts[0] == "read":
             self._run_read()
