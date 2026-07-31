@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 CAMERA_INDEX = 0          # /dev/video0
-WIDTH, HEIGHT = 800, 600
+WIDTH, HEIGHT = 640, 480
 FPS = 60
 
 WINDOW_NAME = "USB Camera (MJPG 60fps)"

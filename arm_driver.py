@@ -1,86 +1,19 @@
 #!/usr/bin/env python3
-"""四轴机械臂 — 坐标显示 + 键盘控制 (极简版)
+"""四轴机械臂 — 坐标显示 + 键盘控制 + 控制台移动 (极简版)
 
 坐标系: +X=左 +Y=前 +Z=上  (右手定则)
-按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  空格→继电器开关  Q/ESC→退出
+按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  Q/ESC→退出
+控制台: 输入增量 <Δ角度°> [Δ前伸mm] [ΔZmm]  例如: 10 100 → 基座+10°, 臂+100mm
 """
 
 import math
-import os
-import signal
+import select
+import sys
 import time
 import argparse
-import subprocess
 import keyboard
 
 from GIM4310_driver import MotorBus, SERIAL_PORT, BAUDRATE
-
-# ── 继电器控制 ────────────────────────────────────────────────────────────────
-RELAY_CHIP = "gpiochip0"
-RELAY_LINE = 112       # Pin 11 → PR.04
-
-
-class Relay:
-    """通过 gpioset --mode=background 控制继电器.
-
-    gpiod v1 默认 mode=exit 会在退出时释放 GPIO，电平不保持，
-    因此使用 background 模式让进程常驻持住电平。
-    低电平触发模块: 0=吸合(开), 1=断开(关).
-    """
-
-    def __init__(self, chip=RELAY_CHIP, line=RELAY_LINE, active_low=True):
-        self._chip = chip
-        self._line = line
-        self._active_low = active_low
-        self._state = False     # 逻辑状态: False=关, True=开
-        self._proc = None       # 后台 gpioset 进程
-        self.off()              # 初始化为关闭
-
-    def _set(self, value):
-        """启动后台 gpioset 进程持住电平，同时杀掉旧进程."""
-        if self._proc is not None:
-            try:
-                if self._proc.poll() is None:
-                    os.kill(self._proc.pid, signal.SIGTERM)
-                    self._proc.wait(timeout=2)
-            except Exception:
-                pass
-        self._proc = subprocess.Popen(
-            ["gpioset", "--mode=background", self._chip, f"{self._line}={value}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-
-    def on(self):
-        val = 0 if self._active_low else 1
-        self._set(val)
-        self._state = True
-
-    def off(self):
-        val = 1 if self._active_low else 0
-        self._set(val)
-        self._state = False
-
-    def toggle(self):
-        if self._state:
-            self.off()
-        else:
-            self.on()
-        return self._state
-
-    @property
-    def is_on(self):
-        return self._state
-
-    def close(self):
-        self.off()
-        if self._proc is not None:
-            try:
-                if self._proc.poll() is None:
-                    os.kill(self._proc.pid, signal.SIGTERM)
-                    self._proc.wait(timeout=2)
-            except Exception:
-                pass
-            self._proc = None
 
 # ── 机械臂尺寸 (mm) ─────────────────────────────────────────────────────────
 L1 = 150.0   # 大臂: 肩→肘
@@ -220,7 +153,7 @@ class Arm:
                 result[addr] = float("nan")
         return result
 
-    def move_joint(self, addr, logical_deg, speed_rpm=30):
+    def move_joint(self, addr, logical_deg, speed_rpm=10):
         """单轴移动 (带限位保护)."""
         lo, hi = JOINT_LIMITS[addr]
         clamped = max(lo, min(hi, logical_deg))
@@ -229,10 +162,36 @@ class Arm:
         target = self._to_motor(addr, clamped)
         self._motors[addr].set_target_position_speed(target, speed_rpm=speed_rpm, wait=False)
 
-    def move_all(self, angles, speed_rpm=30):
+    def move_all(self, angles, speed_rpm=10):
         """多轴同时移动."""
         for addr, deg in angles.items():
             self.move_joint(addr, deg, speed_rpm=speed_rpm)
+
+    def move_to_polar(self, base_deg, r, speed_rpm=10):
+        """移动到极坐标位置 (保持当前Z高度).
+
+        Args:
+            base_deg: 基座角度 (°) — 电机1旋转角
+            r:        前伸距离 (mm) — 水平面内距原点距离
+            speed_rpm: 电机转速
+
+        Returns:
+            (x, y, z): 目标笛卡尔坐标 (mm)
+        """
+        joints = self.get_joints()
+        _, _, z = forward_kinematics(joints)
+
+        lo1, hi1 = JOINT_LIMITS[1]
+        base_deg = max(lo1, min(hi1, base_deg))
+
+        id2, id3 = inverse_kinematics_plane(r, z)
+        id4 = self.get_wrist_target(id2, id3)
+        self.move_all({1: base_deg, 2: id2, 3: id3, 4: id4}, speed_rpm=speed_rpm)
+
+        id1_rad = math.radians(base_deg)
+        x = -r * math.cos(id1_rad)
+        y =  r * math.sin(id1_rad)
+        return x, y, z
 
     # ── 资源管理 ──
 
@@ -289,11 +248,6 @@ def main():
         print(f"初始: X={x0:.1f} Y={y0:.1f} Z={z0:.1f}  "
               f"ID1={id1_target:.1f}°")
 
-        # ── 继电器 ──
-        relay = Relay()
-        space_was_pressed = False
-        print(f"继电器: {'开 🔴' if relay.is_on else '关 ⚫'} (空格切换)")
-
         try:
             while True:
                 if keyboard.is_pressed('esc') or keyboard.is_pressed('q'):
@@ -301,12 +255,6 @@ def main():
                     break
 
                 dirty = False
-
-                # ── 继电器开关: 空格 (上升沿触发, 防抖) ──
-                space_now = keyboard.is_pressed('space')
-                if space_now and not space_was_pressed:
-                    relay.toggle()
-                space_was_pressed = space_now
 
                 # ── 基座旋转: A/D ──
                 if keyboard.is_pressed('a'):
@@ -326,11 +274,21 @@ def main():
                 if keyboard.is_pressed('ctrl'):
                     z_target -= STEP_MM; dirty = True
 
-                # ── 读一次当前状态 ──
-                joints = arm.get_joints()
-                ax, ay, az = forward_kinematics(joints)
-
-                tx, ty, tz = ax, ay, az  # 默认: 目标=实际
+                # ── 控制台输入: <基座角度°> <前伸量mm> [Zmm] ──
+                if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                    line = sys.stdin.readline().strip()
+                    if line:
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            try:
+                                if len(parts) >= 1:
+                                    id1_target = float(parts[0]); dirty = True
+                                if len(parts) >= 2:
+                                    r_target = float(parts[1]); dirty = True
+                                if len(parts) >= 3:
+                                    z_target = float(parts[2]); dirty = True
+                            except ValueError:
+                                print(f"\n⚠ 格式错误，请输入数字，例如: 10 100")
 
                 if dirty:
                     r_old, z_old = r_target, z_target
@@ -343,28 +301,24 @@ def main():
                         id2, id3 = inverse_kinematics_plane(r_target, z_target)
                         id4 = arm.get_wrist_target(id2, id3)
                         arm.move_all({1: id1_target, 2: id2, 3: id3, 4: id4})
-                        id1_rad = math.radians(id1_target)
-                        tx = -r_target * math.cos(id1_rad)
-                        ty =  r_target * math.sin(id1_rad)
-                        tz = z_target
                     except ValueError:
                         # 关节限位内不可达: 撤销按键，停在边界
                         r_target, z_target = r_old, z_old
                         id1_target = id1_old
 
+                # ── 读一次当前状态 ──
+                joints = arm.get_joints()
+                ax, ay, az = forward_kinematics(joints)
+
                 print(f"\r实际 X={ax:+8.1f} Y={ay:+8.1f} Z={az:+8.1f}  |  "
-                      f"目标 X={tx:+8.1f} Y={ty:+8.1f} Z={tz:+8.1f}  |  "
-                      f"J1={joints[1]:+7.1f} J2={joints[2]:+7.1f} J3={joints[3]:+7.1f} J4={joints[4]:+7.1f}  |  "
-                      f"{'🔴 开' if relay.is_on else '⚫ 关'}",
+                      f"目标 角度={id1_target:+7.1f}° r={r_target:+7.1f}mm Z={z_target:+7.1f}mm  |  "
+                      f"J1={joints[1]:+7.1f} J2={joints[2]:+7.1f} J3={joints[3]:+7.1f} J4={joints[4]:+7.1f}",
                       end="", flush=True)
 
                 # time.sleep(0.05)  # 已移除，最大化控制频率
 
         except KeyboardInterrupt:
             print("\n用户中断")
-        finally:
-            relay.close()
-            print("继电器已关闭")
 
 
 if __name__ == "__main__":
