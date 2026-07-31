@@ -18,6 +18,9 @@
        r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
        read               跑一遍装配流程 (等价于 infer.py 按 R 键),
                           输出 #N(原始坐标)-(爆炸图坐标, 旋转角) 碎片数据
+       t1 ~ t4            read 后把第 N 个碎片数据传入 transport 执行:
+                          抓取点=原始坐标, 放置点=爆炸图坐标 (V2 仍自动 -330),
+                          角度=旋转角
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
        status              显示当前位置     ? / help → 本帮助
@@ -65,7 +68,7 @@ ACTION_ID3_DELAY = 0.5   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID
 ACTION_ID4_DELAY = 0.5   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
-TRANS_V_OFFSET = -330.0  # 放置点 V = 抓取点 V - 480 (所有情况都减去 480)
+TRANS_V_OFFSET = -400.0  # 放置点 V = 抓取点 V - 400 
 TRANS_WAIT     = 1.0     # 各步骤之间的等待时间 (s)
 TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤", "⑥")   # 序列步骤圈号 (最多 6 步)
 
@@ -79,6 +82,7 @@ class MainLogic:
         self.arm.on_base_rotate = self._compensate_base_rotation
         self.no_vision = no_vision         # 调试模式: 跳过一切视觉功能
         self._model = None                 # YOLO 模型缓存 (detect_target 与 read 共用)
+        self._fragments = None             # 最近一次 read 的碎片数据 (t1~tN 指令用)
         esp_port = esp_port or detect_esp32_port()
         self.esp = None
         if esp_port:
@@ -212,11 +216,13 @@ class MainLogic:
             cap.release()
         if data is None:
             return
+        self._fragments = data
         print("── 碎片数据: #N(原始坐标)-(爆炸图坐标, 旋转角) ──")
         for d in data:
             ox, oy = d["orig"]
             ex, ey = d["exploded"]
             print(f"  #{d['idx'] + 1}({ox}, {oy})-({ex}, {ey}, {d['rot_deg']:+.1f}°)")
+        print(f"  (输入 t1 ~ t{len(data)} 将对应碎片数据传入 transport 执行搬运)")
 
     def run(self):
         """主逻辑入口 — 启动 → 目标识别 → 控制台控制循环."""
@@ -266,6 +272,8 @@ class MainLogic:
         print("                       例如: transport 200 200 300 300 +60 → 放置点 (300, -30)")
         print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
         print("           read               → 跑一遍装配流程 (等价于 infer.py 按 R), 输出 #N(原始坐标)-(爆炸图坐标, 旋转角)")
+        print("           t1 ~ t4            → 将 read 结果第 N 个碎片数据传入 transport 执行")
+        print("                        (抓取点=原始坐标, 放置点=爆炸图坐标, V2 仍自动 -330, 角度=旋转角)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
@@ -382,6 +390,28 @@ class MainLogic:
                         print("  ⚠ 舵机回旋等待超时")
         print("  ✓ trans 搬运完成")
 
+    def _run_trans_by_fragment(self, n):
+        """tN: 将最近一次 read 结果的第 N 个碎片数据传入 transport 执行.
+
+        抓取点 = 原始坐标 (碎片当前在摄像头画面中的位置);
+        放置点 = 爆炸图坐标 (V2 仍自动 -330, 实际放置 (ex, ey-330));
+        角度   = 拼接对齐旋转角 (可直接作舵机旋转角).
+        """
+        if not self._fragments:
+            print(f"  ⚠ 请先运行 read 获取碎片数据, 再使用 t{n}")
+            return
+        if n < 1 or n > len(self._fragments):
+            print(f"  ⚠ 只有 {len(self._fragments)} 个碎片 (#1 ~ "
+                  f"#{len(self._fragments)}), 没有 #{n}")
+            return
+        d = self._fragments[n - 1]
+        ox, oy = d["orig"]
+        ex, ey = d["exploded"]
+        rot = d["rot_deg"]
+        print(f"  [t{n}] 碎片 #{d['idx'] + 1}: 抓取 ({ox:.0f}, {oy:.0f}) → "
+              f"放置 ({ex:.0f}, {ey:.0f}) 旋转 {rot:+.1f}°")
+        self._run_trans(ox, oy, rot, ex, ey)
+
     def _apply_command(self, line):
         """解析控制台指令: 绝对笛卡尔 <Xmm> <Ymm> [Zmm] → move_tool_to."""
         parts = line.split()
@@ -431,6 +461,11 @@ class MainLogic:
             return
         if parts[0] == "read":
             self._run_read()
+            return
+        # tN (t1~t4): read 后把第 N 个碎片数据传入 transport 执行
+        if (len(parts[0]) > 1 and parts[0][0] == "t"
+                and parts[0][1:].isdigit()):
+            self._run_trans_by_fragment(int(parts[0][1:]))
             return
         if parts[0] in ("r", "servo"):
             if not self.servo:
