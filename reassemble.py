@@ -466,34 +466,24 @@ def _dfs_place(polygons, merged_poly, display_frags, edge_matches, remaining_ord
 EXPLODED_VIEW_W = 640
 EXPLODED_VIEW_H = 480
 
-# 几何中心点绘制配置
-CENTROID_RADIUS = 4           # 中心点半径
-CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
-CENTROID_THICKNESS = -1       # 填充圆点
 
-
-def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
+def _exploded_layout(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
     """
-    绘制爆炸图：重心径向推开。
+    计算爆炸图布局：每个碎片沿「重心 → 碎片质心」方向径向推开。
 
-    碎片保持实际像素大小不变（与摄像头画面 1:1，所占像素一致），
-    每个碎片沿「重心 → 碎片质心」方向向外推移，推力与距重心距离成正比。
-    若推开后的布局超出画布，自动等比缩小推力（只改变爆炸间距，不改变
-    碎片大小），布局整体居中绘制在固定尺寸画布上，并标出每个碎片的
-    几何中心坐标。
+    与 draw_exploded_view 的绘制逻辑共用同一套几何计算（含超出画布时
+    等比缩小推力、布局整体居中），供输出碎片爆炸图坐标等数据使用。
 
     Args:
         fragments: [(idx, poly, rot_deg), ...] 已对齐的碎片列表
-                   (rot_deg 为相对原始位姿的旋转角, 顺时针为负、逆时针为正)
-        gap: 缩放系数，越大推得越开（默认 0.3）
+        gap: 缩放系数，越大推得越开（默认 0.5）
         canvas_size: 输出画布尺寸 (宽, 高)
 
     Returns:
-        canvas: 爆炸图图像（固定 canvas_size，碎片 1:1 像素）
+        (positions, offset):
+          positions[i] — fragments[i] 对应碎片在爆炸图画布上的顶点坐标
+          offset       — 布局整体居中的平移量
     """
-    if len(fragments) < 2:
-        return draw_result(fragments)
-
     tw, th = canvas_size
     n = len(fragments)
     originals = [f.copy() for _, f, _ in fragments]
@@ -544,6 +534,39 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
     offset = np.array([(tw - (bb_max[0] - bb_min[0])) / 2 - bb_min[0],
                        (th - (bb_max[1] - bb_min[1])) / 2 - bb_min[1]],
                       dtype=np.float32)
+
+    return positions, offset
+
+# 几何中心点绘制配置
+CENTROID_RADIUS = 4           # 中心点半径
+CENTROID_COLOR = (0, 255, 0)  # 中心点颜色 (绿色)
+CENTROID_THICKNESS = -1       # 填充圆点
+
+
+def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODED_VIEW_H)):
+    """
+    绘制爆炸图：重心径向推开。
+
+    碎片保持实际像素大小不变（与摄像头画面 1:1，所占像素一致），
+    每个碎片沿「重心 → 碎片质心」方向向外推移，推力与距重心距离成正比。
+    若推开后的布局超出画布，自动等比缩小推力（只改变爆炸间距，不改变
+    碎片大小），布局整体居中绘制在固定尺寸画布上，并标出每个碎片的
+    几何中心坐标。
+
+    Args:
+        fragments: [(idx, poly, rot_deg), ...] 已对齐的碎片列表
+                   (rot_deg 为相对原始位姿的旋转角, 顺时针为负、逆时针为正)
+        gap: 缩放系数，越大推得越开（默认 0.3）
+        canvas_size: 输出画布尺寸 (宽, 高)
+
+    Returns:
+        canvas: 爆炸图图像（固定 canvas_size，碎片 1:1 像素）
+    """
+    if len(fragments) < 2:
+        return draw_result(fragments)
+
+    tw, th = canvas_size
+    positions, offset = _exploded_layout(fragments, gap, canvas_size)
 
     # ---- 绘制 ----
     canvas = np.full((th, tw, 3), 30, dtype=np.uint8)

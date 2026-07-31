@@ -3,7 +3,9 @@
 
 import cv2
 import gc
+import subprocess
 import sys
+import tempfile
 import time
 import os
 from datetime import datetime
@@ -12,8 +14,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from reassemble import (masks_from_yolo, reassemble, draw_exploded_view,
-                        create_combined_view, draw_fragments_on_original,
-                        force_max_vertices)
+                        _exploded_layout, create_combined_view,
+                        draw_fragments_on_original, force_max_vertices)
 
 # ===== 配置 =====
 MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.pt"
@@ -24,6 +26,9 @@ CONF_THRESH = 0.5
 
 WINDOW_NAME = "YOLO Seg - GPU"
 COMBINED_WINDOW_NAME = "Combined View"
+
+# 组合图独立窗口: 主进程把图存成 PNG, 由独立进程 view_image.py 弹出
+VIEW_PNG_PATH = os.path.join(tempfile.gettempdir(), "vision_combined_view.png")
 
 # ===== 顶点显示配置 =====
 VERTEX_RADIUS = 4          # 顶点圆点半径
@@ -42,6 +47,10 @@ CENTROID_THICKNESS = -1     # 填充圆点
 SMOOTH_ALPHA = 0.3         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
 MAX_MATCH_DIST = 30        # 帧间顶点/轨迹匹配的最大距离 (像素)
 MAX_LOST_FRAMES = 10       # 目标丢失后轨迹保留的帧数
+
+# ===== 单帧流程 (启动识别 / read) 的时域平滑 =====
+DETECT_SMOOTH_FRAMES = 10  # detect_first_target 平滑累积的命中帧数
+READ_SMOOTH_FRAMES = 10    # read 流程平滑采集的帧数
 
 
 def build_gst_pipeline(cam_idx, width, height, fps):
@@ -251,20 +260,29 @@ def open_camera(cam_idx=CAMERA_INDEX, width=WIDTH, height=HEIGHT, fps=FPS):
     return None
 
 
-def detect_first_target(model, cap, max_frames=None):
-    """循环推理, 检测到第一个目标时返回其中心点像素坐标与类别名.
+def detect_first_target(model, cap, max_frames=None,
+                        smooth_frames=DETECT_SMOOTH_FRAMES):
+    """循环推理, 检测到目标时返回**时域平滑后**的中心点像素坐标与类别名.
 
     中心点 = 面积最大的 mask 轮廓多边形近似的几何中心 (与显示逻辑一致,
-    见 mask_to_polygon_pts / polygon_centroid).
+    见 mask_to_polygon_pts / polygon_centroid); 多边形顶点先经
+    VertexSmoother 时域平滑 (连续累积 smooth_frames 帧命中) 再算质心,
+    抑制单帧分割噪声引起的坐标抖动.
 
     Args:
         model: 已加载的 YOLO 模型 (load_model 返回值)
         cap:   已打开的 VideoCapture (open_camera 返回值)
         max_frames: 最多读取帧数, None 表示无限等待
+        smooth_frames: 平滑累积的命中帧数, 达到后返回平滑质心
+                       (目标丢失后轨迹保留 MAX_LOST_FRAMES 帧, 期间恢复
+                       继续累积; 新轨迹则重新累积)
 
     Returns:
         (cx, cy, class_name); 未检测到 (或 max_frames 耗尽 / 读帧失败) 时返回 None.
     """
+    smoother = VertexSmoother()
+    hit = 0
+    cls = "unknown"
     frames = 0
     while max_frames is None or frames < max_frames:
         ret, frame = cap.read()
@@ -278,7 +296,7 @@ def detect_first_target(model, cap, max_frames=None):
             boxes = results[0].boxes
             cls_ids = boxes.cls if boxes is not None else None
             best_area = -1.0
-            best = None
+            best_pts = None
             for mi, mask_tensor in enumerate(masks.data):
                 pts = mask_to_polygon_pts(mask_tensor, frame.shape)
                 if pts is None:
@@ -286,17 +304,169 @@ def detect_first_target(model, cap, max_frames=None):
                 area = cv2.contourArea(np.array(pts))
                 if area > best_area:
                     best_area = area
+                    best_pts = pts
                     if cls_ids is not None and mi < len(cls_ids):
                         cls = results[0].names[int(cls_ids[mi])]
                     else:
                         cls = "unknown"
-                    best = polygon_centroid(pts), cls
-            if best is not None:
-                (cx, cy), cls = best
-                return cx, cy, cls
+            if best_pts is not None:
+                # 时域平滑: 平滑器新建轨迹时重新累积
+                before = len(smoother.tracks)
+                smoothed_pts = smoother.update(best_pts)
+                if len(smoother.tracks) > before:
+                    hit = 0
+                hit += 1
+                if hit >= smooth_frames:
+                    cx, cy = polygon_centroid(smoothed_pts)
+                    return cx, cy, cls
         del results
         frames += 1
     return None
+
+
+def _show_combined_view(combined):
+    """把三合一组合图存为 PNG, 用独立进程弹出窗口 (单次弹出, 可单独关闭).
+
+    窗口由独立的 view_image.py 进程持有: 关闭窗口 (q/Esc/点 X) 或该
+    子进程本身崩溃, 都不影响主进程; 主进程保存后立即返回, 不阻塞.
+    """
+    if not cv2.imwrite(VIEW_PNG_PATH, combined):
+        print(f"⚠ 保存组合图失败: {VIEW_PNG_PATH}")
+        return
+    viewer = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "view_image.py")
+    print("✓ 拼接完成 — 组合图已用独立窗口弹出 "
+          f"'{COMBINED_WINDOW_NAME}' (爆炸图 | 实物图 | 装配图)")
+    print(f"  按 q / Esc 或点击窗口 X 关闭, 不影响主进程")
+    print(f"  图片文件: {VIEW_PNG_PATH}")
+    subprocess.Popen([sys.executable, viewer, VIEW_PNG_PATH,
+                      COMBINED_WINDOW_NAME])
+
+
+def _smooth_fragments(model, cap, frames=READ_SMOOTH_FRAMES, min_frags=2):
+    """连续采集 frames 帧, 对每个碎片多边形顶点做时域平滑.
+
+    碎片身份按质心最近邻跨帧一对一匹配 (与 VertexSmoother 同思路),
+    每个碎片一个平滑器; 碎片不足 min_frags 个的帧跳过 (轨迹由平滑器
+    内部按 MAX_LOST_FRAMES 保留, 期间恢复可继续累积).
+
+    Returns:
+        (last_frame, [平滑多边形...], [平滑质心...]) — 最后一次
+        有效帧的结果; 读帧失败返回 None.
+    """
+    smoothers = []     # 每个碎片: {"sm": VertexSmoother, "cx", "cy", "used"}
+    last = None        # (frame, polygons, centroids)
+    max_d2 = MAX_MATCH_DIST ** 2
+    for _ in range(frames):
+        ret, frame = cap.read()
+        if not ret:
+            print("读取帧失败")
+            return None
+        results = model(frame, verbose=False, conf=CONF_THRESH, half=True)
+        polys = masks_from_yolo(results)
+        del results
+        if len(polys) < min_frags:
+            continue
+
+        for sm in smoothers:
+            sm["used"] = False
+        matched = []
+        for k, pts in enumerate(polys):
+            raw_cent = polygon_centroid(pts)
+            best_sm, best_d2 = None, max_d2
+            for sm in smoothers:
+                if sm["used"]:
+                    continue
+                d2 = (raw_cent[0] - sm["cx"]) ** 2 + (raw_cent[1] - sm["cy"]) ** 2
+                if d2 < best_d2:
+                    best_d2, best_sm = d2, sm
+            if best_sm is not None:
+                best_sm["used"] = True
+                smoothed = best_sm["sm"].update(pts)
+                cent = polygon_centroid(smoothed)
+                best_sm["cx"], best_sm["cy"] = cent
+            else:
+                sm_new = {"sm": VertexSmoother(), "used": True,
+                          "cx": raw_cent[0], "cy": raw_cent[1]}
+                smoothed = sm_new["sm"].update(pts)
+                cent = polygon_centroid(smoothed)
+                sm_new["cx"], sm_new["cy"] = cent
+                smoothers.append(sm_new)
+            matched.append((smoothed, cent))
+        # 清理轨迹已超期 (tracks 清空) 的平滑器, 避免残留质心误匹配
+        smoothers = [sm for sm in smoothers if sm["sm"].tracks]
+        last = (frame, [p for p, _ in matched], [c for _, c in matched])
+    return last
+
+
+def run_read_pipeline(model, cap, show_view=True,
+                      smooth_frames=READ_SMOOTH_FRAMES):
+    """跑一遍完整装配流程 (等价于主循环按 R 键) 并输出每个碎片的坐标数据.
+
+    连续采集 smooth_frames 帧 → 碎片顶点跨帧时域平滑 → 拼接 → 爆炸图 →
+    三合一组合图, 再按原始图像碎片编号返回:
+
+      原始坐标   = 摄像头画面中**平滑后**碎片多边形的几何中心 (像素)
+      爆炸图坐标 = 爆炸图 (640x480 画布) 中该碎片位置的几何中心 (像素)
+      旋转角     = 拼接对齐时相对原始位姿的旋转角 (°, 顺时针为负、逆时针为正)
+
+    Args:
+        model: 已加载的 YOLO 模型 (load_model 返回值)
+        cap:   已打开的 VideoCapture (open_camera 返回值)
+        show_view: 是否用独立进程弹出三合一组合窗口 (可单独关闭,
+                   不影响主进程)
+        smooth_frames: 平滑采集帧数 (碎片多边形经时域平滑后再拼接)
+
+    Returns:
+        按原始编号 (idx) 排序的列表, 每项 dict:
+            {"idx": int, "orig": (cx, cy), "exploded": (cx, cy),
+             "rot_deg": float}
+        失败 (读帧失败 / 碎片不足 / 拼接失败) 返回 None, 原因已打印.
+    """
+    smoothed = _smooth_fragments(model, cap, frames=smooth_frames)
+    if smoothed is None:
+        print("read: 平滑采集帧读取失败")
+        return None
+    frame, masks, orig_centroids = smoothed
+    try:
+        if len(masks) < 2:
+            print(f"需要至少 2 个碎片，当前仅检测到 {len(masks)} 个")
+            return None
+
+        canvas, _, display_frags, _ = reassemble(masks)
+
+        # 爆炸图
+        exploded = draw_exploded_view(display_frags)
+        positions, offset = _exploded_layout(display_frags)
+
+        # 原始帧上标注碎片
+        fragments_img = draw_fragments_on_original(frame, masks)
+
+        # 三合一组合图：爆炸图 | 实物图 | 装配图 (独立进程弹出, 可单独关闭)
+        combined = create_combined_view(exploded, fragments_img, canvas)
+        if show_view:
+            _show_combined_view(combined)
+
+        # ---- 每个碎片的原始坐标 / 爆炸图坐标 / 旋转角 ----
+        data = []
+        for i, (orig_idx, _poly, rot_deg) in enumerate(display_frags):
+            frag_s = (positions[i] + offset).astype(np.int32)   # 与绘制一致
+            M = cv2.moments(frag_s.astype(np.float32))
+            if M['m00'] > 0:
+                ex_c = (int(M['m10'] / M['m00']), int(M['m01'] / M['m00']))
+            else:
+                ex_c = (int(frag_s[:, 0].mean()), int(frag_s[:, 1].mean()))
+            data.append({"idx": orig_idx,
+                         "orig": orig_centroids[orig_idx],
+                         "exploded": ex_c,
+                         "rot_deg": float(rot_deg)})
+        data.sort(key=lambda d: d["idx"])   # 按原始图像编号 #1 #2 #3 ... 输出
+        return data
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"拼接失败: {e}")
+        return None
 
 
 def main():

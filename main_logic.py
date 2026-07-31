@@ -13,6 +13,8 @@
        put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
        trans <u> <v>      搬运: n <u> <v> 0 → action → n <u> <v+V_OFFSET> 0 → put
        r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
+       read               跑一遍装配流程 (等价于 infer.py 按 R 键),
+                          输出 #N(原始坐标)-(爆炸图坐标, 旋转角) 碎片数据
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
        status              显示当前位置     ? / help → 本帮助
@@ -62,6 +64,7 @@ class MainLogic:
     def __init__(self, esp_port=None, no_vision=False):
         self.arm = CartesianArm()          # 机械臂 + 笛卡尔控制层 (含手腕水平参考)
         self.no_vision = no_vision         # 调试模式: 跳过一切视觉功能
+        self._model = None                 # YOLO 模型缓存 (detect_target 与 read 共用)
         esp_port = esp_port or detect_esp32_port()
         self.esp = None
         if esp_port:
@@ -110,7 +113,7 @@ class MainLogic:
             print(f"⚠ 无法加载目标识别模块: {e}")
             return
         try:
-            model = infer.load_model()
+            model = self._get_model()
             cap = infer.open_camera()
             if cap is None:
                 print("⚠ 无法打开摄像头, 跳过目标识别")
@@ -134,6 +137,47 @@ class MainLogic:
             print("⚠ 目标识别被中断, 跳过")
         except Exception as e:
             print(f"⚠ 目标识别失败: {e}")
+
+    def _get_model(self):
+        """惰性加载并缓存 YOLO 模型 (detect_target 与 read 共用)."""
+        if self._model is None:
+            import infer
+            self._model = infer.load_model()
+        return self._model
+
+    def _run_read(self):
+        """read: 跑一遍完整装配流程 (等价于 infer.py 按 R 键) 并输出碎片数据.
+
+        输出格式: #N(原始坐标)-(爆炸图坐标, 旋转角)
+        原始坐标 = 摄像头画面中碎片多边形几何中心 (像素);
+        爆炸图坐标 = 爆炸图画布中该碎片位置几何中心 (像素);
+        旋转角 = 拼接对齐相对原始位姿的旋转角 (°, 顺时针为负、逆时针为正).
+        """
+        try:
+            import infer
+        except Exception as e:
+            print(f"⚠ 无法加载目标识别模块: {e}")
+            return
+        try:
+            model = self._get_model()
+        except Exception as e:
+            print(f"⚠ 模型加载失败: {e}")
+            return
+        cap = infer.open_camera()
+        if cap is None:
+            print("⚠ 无法打开摄像头, 跳过 read")
+            return
+        try:
+            data = infer.run_read_pipeline(model, cap)
+        finally:
+            cap.release()
+        if data is None:
+            return
+        print("── 碎片数据: #N(原始坐标)-(爆炸图坐标, 旋转角) ──")
+        for d in data:
+            ox, oy = d["orig"]
+            ex, ey = d["exploded"]
+            print(f"  #{d['idx'] + 1}({ox}, {oy})-({ex}, {ey}, {d['rot_deg']:+.1f}°)")
 
     def run(self):
         """主逻辑入口 — 启动 → 目标识别 → 控制台控制循环."""
@@ -179,6 +223,7 @@ class MainLogic:
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
         print(f"           trans <u> <v>      → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → 放下")
         print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
+        print("           read               → 跑一遍装配流程 (等价于 infer.py 按 R), 输出 #N(原始坐标)-(爆炸图坐标, 旋转角)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
@@ -272,6 +317,9 @@ class MainLogic:
                 print("  ⚠ 需要两个参数 (相机像素坐标): trans <u> <v>  例如: trans 123 85")
                 return
             self._run_trans(vals[0], vals[1])
+            return
+        if parts[0] == "read":
+            self._run_read()
             return
         if parts[0] in ("r", "servo"):
             if not self.servo:
