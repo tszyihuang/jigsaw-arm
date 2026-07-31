@@ -5,11 +5,9 @@
   1. 机械臂移动到待机位置 (实际笛卡尔坐标 X=-9, Y=0, Z=+80 mm)
   2. 向 ESP32 发送 red_on, 红灯亮起, 并保持待机
   3. 控制台输入指令移动机械臂:
-       增量 (相对当前位置): <Δ角度°> [Δ前伸mm] [ΔZmm]
-         例: 10 100   → 基座 +10°, 前伸 +100mm (Z 不变)
-             -5 20 10 → 基座 -5°, 前伸 +20mm, Z +10mm
-       绝对 (笛卡尔坐标): xyz <Xmm> <Ymm> [Zmm]
-         例: xyz 100 50 80 → 移动到 (X=100, Y=50, Z=80)
+       <Xmm> <Ymm> [Zmm]   绝对笛卡尔坐标, Z 缺省保持当前
+       例: 90 0 → 移动到 (X=90, Y=0)
+       home / standby      回到待机位置 (X=-9, Y=0, Z=80)
 
 极坐标换算 (由 arm_driver.forward_kinematics 的 FK 反解):
     FK:  x = -r·cos(θ1),  y = r·sin(θ1)
@@ -17,6 +15,8 @@
     待机: r = √((-9)²+0²) = 9.0 mm,  θ1 = atan2(0, 9) = 0°
     Z 不变 (80 mm), 臂平面内用 inverse_kinematics_plane(r, z) 解 ID2/ID3,
     ID4 由手腕水平参考自动维持.
+    move_to_cartesian 采用 r<0 约定: r = -√(x²+y²), θ1 = atan2(y, x),
+    使正 X 半平面 θ1 ∈ [-90°, 90°], 避开基座 ±90° 限位.
 
 用法:
     python3 main_logic.py                  # 自动检测 ESP32 串口
@@ -101,7 +101,7 @@ class Esp32Cmd:
 
 
 class MainLogic:
-    """机械臂主逻辑 — 启动流程 + 控制台控制 (增量 / 绝对笛卡尔)."""
+    """机械臂主逻辑 — 启动流程 + 控制台绝对笛卡尔控制."""
 
     def __init__(self, esp_port=None):
         self._target = None               # 当前目标极坐标状态 (startup 或首次移动时初始化)
@@ -146,6 +146,22 @@ class MainLogic:
                 return True
             time.sleep(0.1)
         return False
+
+    def go_home(self, wait=True, speed_rpm=STANDBY_SPEED_RPM):
+        """回到待机位置 (X=-9, Y=0, Z=80) 并更新目标状态.
+
+        Returns:
+            target: 目标关节角 {1..4: deg}
+        """
+        target = self.go_standby(speed_rpm=speed_rpm)
+        base_deg, r = cartesian_to_polar(STANDBY_X, STANDBY_Y)
+        self._target = {"base": base_deg, "r": r, "z": STANDBY_Z}
+        if wait:
+            if self.wait_for_arrival(target, timeout=15.0):
+                print("  ✓ 已到达待机位置")
+            else:
+                print("  ⚠ 等待超时未到达")
+        return target
 
     # ── 移动接口 (增量 / 绝对笛卡尔) ──
 
@@ -201,8 +217,8 @@ class MainLogic:
                           speed_rpm=STANDBY_SPEED_RPM):
         """移动到绝对笛卡尔坐标 (X, Y, Z).
 
-        内部转换为极坐标 (基座角 θ1, 前伸 r) 后 IK 求解移动:
-            r  = √(x²+y²),  θ1 = atan2(y, -x)
+        内部转换为极坐标 (基座角 θ1, 前伸 r) 后 IK 求解移动 (r<0 约定):
+            r = -√(x²+y²),  θ1 = atan2(y, x)
 
         Args:
             x, y: 笛卡尔水平坐标 (mm)
@@ -260,12 +276,11 @@ class MainLogic:
 
     def _print_usage(self):
         """打印控制台指令说明."""
-        print("控制台指令 (增量):  <Δ角度°> [Δ前伸mm] [ΔZmm]")
-        print("控制台指令 (绝对):  xyz <Xmm> <Ymm> [Zmm]")
-        print("  例: 10 100        → 基座 +10°, 前伸 +100mm (Z 不变)")
-        print("      -5 20 10      → 基座 -5°, 前伸 +20mm, Z +10mm")
-        print("      xyz 100 50 80 → 移动到 (X=100, Y=50, Z=80)")
-        print("      status        → 显示当前位置     ? / help → 本帮助")
+        print("控制台指令: <Xmm> <Ymm> [Zmm]   (绝对笛卡尔坐标, Z 缺省保持当前)")
+        print("           home               → 回到待机位置 (X=-9, Y=0, Z=80)")
+        print("  例: 90 0      → 移动到 (X=90,  Y=0)")
+        print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
+        print("      status    → 显示当前位置     ? / help → 本帮助")
 
     def _show_status(self):
         """显示当前实际关节角与末端坐标."""
@@ -276,38 +291,24 @@ class MainLogic:
         print(f"        末端 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm")
 
     def _apply_command(self, line):
-        """解析控制台指令并转调对应接口: 增量 / 绝对笛卡尔."""
+        """解析控制台指令: 绝对笛卡尔 <Xmm> <Ymm> [Zmm] → move_to_cartesian."""
         parts = line.split()
         if parts[0] in ("?", "h", "help"):
             self._print_usage()
             return
-        if parts[0] in ("xyz", "goto"):
-            self._apply_cartesian(parts[1:])
+        if parts[0] in ("home", "standby"):
+            self.go_home()
             return
         try:
             vals = [float(p) for p in parts]
         except ValueError:
-            print("  ⚠ 格式错误, 请输入: <Δ角度°> [Δ前伸mm] [ΔZmm]  例如: 10 100")
-            print("      或绝对坐标: xyz <Xmm> <Ymm> [Zmm]  例如: xyz 100 50 80")
-            return
-        if len(vals) > 3:
-            print("  ⚠ 参数过多, 最多 3 个: <Δ角度°> [Δ前伸mm] [ΔZmm]")
-            return
-        d_base, d_r, d_z = (vals + [0.0, 0.0, 0.0])[:3]
-        self.move_by_delta(d_base, d_r, d_z)
-
-    def _apply_cartesian(self, parts):
-        """解析绝对笛卡尔指令: xyz <Xmm> <Ymm> [Zmm], 转调 move_to_cartesian."""
-        try:
-            vals = [float(p) for p in parts]
-        except ValueError:
-            print("  ⚠ 格式错误, 请输入: xyz <Xmm> <Ymm> [Zmm]  例如: xyz 100 50 80")
+            print("  ⚠ 格式错误, 请输入: <Xmm> <Ymm> [Zmm]  例如: 90 0")
             return
         if len(vals) < 2:
-            print("  ⚠ 至少需要 X 和 Y: xyz <Xmm> <Ymm> [Zmm]")
+            print("  ⚠ 至少需要 X 和 Y: <Xmm> <Ymm> [Zmm]  例如: 90 0")
             return
         if len(vals) > 3:
-            print("  ⚠ 参数过多: xyz <Xmm> <Ymm> [Zmm]")
+            print("  ⚠ 参数过多, 最多 3 个: <Xmm> <Ymm> [Zmm]")
             return
         x, y = vals[0], vals[1]
         z = vals[2] if len(vals) > 2 else None
@@ -373,7 +374,7 @@ class MainLogic:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="机械臂主逻辑 — 启动 + 控制台控制 (增量 / 绝对笛卡尔)")
+    parser = argparse.ArgumentParser(description="机械臂主逻辑 — 启动 + 控制台绝对笛卡尔控制")
     parser.add_argument("--esp-port", default=None,
                         help="ESP32 串口 (默认自动检测)")
     args = parser.parse_args()
