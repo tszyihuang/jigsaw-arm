@@ -467,7 +467,7 @@ def main():
                                 if len(parts) >= 1:
                                     id1_target = float(parts[0]); dirty = True
                                 if len(parts) >= 2:
-                                    r_target = float(parts[1]); dirty = True
+                                    r_target = -float(parts[1]); dirty = True   # 前伸量取反
                                 if len(parts) >= 3:
                                     z_target = float(parts[2]); dirty = True
                             except ValueError:
