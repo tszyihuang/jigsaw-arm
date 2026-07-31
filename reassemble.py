@@ -615,7 +615,7 @@ def draw_exploded_view(fragments, gap=0.5, canvas_size=(EXPLODED_VIEW_W, EXPLODE
     return canvas
 
 
-def reassemble(masks, area_threshold=0.92, target_vertices=4):
+def reassemble(masks, area_threshold=0.95, target_vertices=4):
     """
     碎片拼接主逻辑（DFS 回溯 + 顶点数校验）。
 

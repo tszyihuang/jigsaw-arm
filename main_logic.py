@@ -12,7 +12,7 @@
        action             下降到 Z_DOWN → 继电器吸合 → Z 回升到 0 (抓取)
        put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
        trans <u> <v> [角度]  搬运: 抓取点 → 抓取 → 放置点 → [舵机旋转角度] → 放下
-                       (角度可选, 放置点放下前旋转, 正=逆时针, 如: trans 123 85 +60)
+                       (角度可选, 放置点放下前旋转, 正=逆时针, 如: trans 123 85 )
        transport <u1> <v1> <u2> <v2> [角度]  同 trans, 但放置点显式指定
                        (V2 仍自动 -330, 如: transport 200 200 300 300 +60 → 放置点 300, -30)
        r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
@@ -59,17 +59,17 @@ STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 SERVO_BASE_COMP_GAIN = -1.0
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
-ACTION_Z_DOWN = -41.0   # ① 下降到该高度
-ACTION_Z_UP   =   -30.0   # ④ 动作结束后 Z 回升到该高度
+ACTION_Z_DOWN = -39.0   # ① 下降到该高度
+ACTION_Z_UP   =   -20.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
-ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
-ACTION_ID3_DELAY = 0.1   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
-ACTION_ID4_DELAY = 0.1   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
+ACTION_SPEED_RPM = 5.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
+ACTION_ID3_DELAY = 0.6   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
+ACTION_ID4_DELAY = 0.6   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
 TRANS_V_OFFSET = -400.0  # 放置点 V = 抓取点 V - 400 
-TRANS_WAIT     = 1.0     # 各步骤之间的等待时间 (s)
+TRANS_WAIT     = 1.5     # 各步骤之间的等待时间 (s)
 TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤", "⑥")   # 序列步骤圈号 (最多 6 步)
 
 

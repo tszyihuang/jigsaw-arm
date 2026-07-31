@@ -326,6 +326,69 @@ class Motor:
         params[15] = code
         self.write_user_params(bytes(params))
 
+    # ── 运动控制参数 (位置/速度环 PID, 0x14/0x15/0x16) ──────────────────────
+
+    def _parse_motion_params(self, raw: bytes) -> dict:
+        """解析 0x14/0x15/0x16 应答 (24 字节运动控制参数)."""
+        if len(raw) < 24:
+            raise ValueError(
+                f"运动控制参数应答过短: 期望≥24字节, 实际{len(raw)}字节"
+            )
+        pos_kp, pos_ki = struct.unpack_from("<ff", raw, 0)
+        pos_max_speed = struct.unpack_from("<I", raw, 8)[0]
+        vel_kp, vel_ki = struct.unpack_from("<ff", raw, 12)
+        vel_max_current = struct.unpack_from("<I", raw, 20)[0]
+        return dict(
+            pos_kp=pos_kp,
+            pos_ki=pos_ki,
+            pos_max_speed_rpm=pos_max_speed * 0.01,
+            vel_kp=vel_kp,
+            vel_ki=vel_ki,
+            vel_max_current_a=vel_max_current * 0.001,
+        )
+
+    def read_motion_params(self) -> dict:
+        """读取运动控制参数 (0x14): 位置环 Kp/Ki、速度环 Kp/Ki 与输出限制.
+
+        返回 dict:
+            pos_kp / pos_ki       — 位置环增益 (float)
+            pos_max_speed_rpm     — 位置模式最大速度 (rpm, 位置环输出限制)
+            vel_kp / vel_ki       — 速度环增益 (float)
+            vel_max_current_a     — 速度/位置模式最大 Q 轴电流 (A, 速度环输出限制)
+        """
+        return self._parse_motion_params(self._send(0x14))
+
+    def write_motion_params(self, *, pos_kp=None, pos_ki=None,
+                            pos_max_speed_rpm=None, vel_kp=None, vel_ki=None,
+                            vel_max_current_a=None, save=False) -> dict:
+        """写入运动控制参数: 0x15 在线生效不保存 / 0x16 写入并保存.
+
+        未指定的字段保持电机当前值 (先读 0x14 再合并).
+        save=False (默认): 调试阶段在线调整, 掉电恢复;
+        save=True: 写入 flash 掉电保留 — 确认参数满意后再保存.
+
+        建议: 每次只改一个参数, 小步 (±20~50%) 调整, 用实际运动效果
+        (到位速度 / 振荡 / 过冲) 判断, 全部满意后再 save=True 保存.
+        """
+        cur = self.read_motion_params()
+        pos_kp = cur["pos_kp"] if pos_kp is None else float(pos_kp)
+        pos_ki = cur["pos_ki"] if pos_ki is None else float(pos_ki)
+        vel_kp = cur["vel_kp"] if vel_kp is None else float(vel_kp)
+        vel_ki = cur["vel_ki"] if vel_ki is None else float(vel_ki)
+        speed = (cur["pos_max_speed_rpm"] if pos_max_speed_rpm is None
+                 else float(pos_max_speed_rpm))
+        curr = (cur["vel_max_current_a"] if vel_max_current_a is None
+                else float(vel_max_current_a))
+        for name, val in [("pos_kp", pos_kp), ("pos_ki", pos_ki),
+                          ("vel_kp", vel_kp), ("vel_ki", vel_ki)]:
+            _require_finite(val, name)
+        _require_non_negative(speed, "pos_max_speed_rpm")
+        _require_non_negative(curr, "vel_max_current_a")
+        data = struct.pack("<ffIffI", pos_kp, pos_ki, int(speed / 0.01),
+                           vel_kp, vel_ki, int(curr / 0.001))
+        cmd = 0x16 if save else 0x15
+        return self._parse_motion_params(self._send(cmd, data))
+
     # ── 位置控制 ──────────────────────────────────────────────────────────────
 
     def set_target_position(self, angle_deg: float) -> dict:
