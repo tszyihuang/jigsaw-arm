@@ -29,9 +29,13 @@ L3 = 0.0     # 手部: 腕→末端
 TOOL_OFFSET_X = 12.0   # 执行器中心: 局部 +x 偏移 (mm)
 TOOL_OFFSET_Y = -36.0  # 执行器中心: 局部 +y 偏移 (mm, 实际为 -36)
 
-# ── 上电偏置检测: 首次读数 > 18° 时, 该电机本会话减去 36° ───────────────────
-BIAS_THRESHOLD  = 18.0    # 首次读取超过该值 (°) 触发修正
-BIAS_CORRECTION = -36.0   # 修正量 (°), 叠加到编码器读数上
+# ── 上电零点: 每次上电以电机当前位置为零点 ─────────────────────────────────
+# 上电时读取每个电机多圈角, 记为 _bias[addr] = -读数, 之后读数减去它
+# (= 相对上电位置的增量), 再叠加偏置参数 JOINT_OFFSETS/JOINT_SIGNS 得逻辑角:
+#   逻辑角 = JOINT_OFFSETS[addr] + JOINT_SIGNS[addr] × (读数 − 上电读数)
+# 仅软件修正读数, 不移动电机.
+# ⚠ 逻辑零点 = 上电时刻的机械姿态, 须保证每次上电姿态一致 (失能自由下垂),
+#   否则逻辑零点漂移, 限位与待机坐标全部错位.
 
 # ── 关节限位 (逻辑角度, °) ──────────────────────────────────────────────────
 JOINT_LIMITS  = {1: (-90, 90), 2: (-5, 180), 3: (0, 160), 4: (-120, 120)}  # ID4 自动维持水平
@@ -193,9 +197,12 @@ class Arm:
     # ── 上电编码器偏置检测 ──
 
     def _detect_bias(self):
-        """首次读取编码器: 读数 > BIAS_THRESHOLD 的电机, 本会话角度减去修正量.
+        """上电零点: 记录每个电机当前多圈角, 之后读数减去它 (=当前位置为零点).
 
-        仅软件修正读数, 不移动电机; 补偿上电时多圈计数跳变.
+        每次上电把当前机械姿态作为逻辑零点 (仅软件修正读数, 不移动电机):
+            逻辑角 = JOINT_OFFSETS[addr] + JOINT_SIGNS[addr] × (读数 − 上电读数)
+        即先零化, 再应用偏置参数 (JOINT_OFFSETS/JOINT_SIGNS).
+        ⚠ 逻辑零点对应上电时刻的机械姿态, 须保证每次上电姿态一致.
         """
         for addr in self._motors:
             try:
@@ -203,13 +210,11 @@ class Arm:
             except Exception:
                 raw = float("nan")
             if math.isnan(raw):
-                print(f"  ID={addr}: 首次读取失败, 不修正")
-            elif raw > BIAS_THRESHOLD:
-                self._bias[addr] = BIAS_CORRECTION
-                print(f"  ID={addr}: 首次读数 {raw:.2f}° > {BIAS_THRESHOLD:.0f}°, "
-                      f"本会话减去 {abs(BIAS_CORRECTION):.0f}°")
+                print(f"  ID={addr}: 首次读取失败, 不设零点")
             else:
-                print(f"  ID={addr}: 首次读数 {raw:.2f}°, 无需修正")
+                self._bias[addr] = -raw
+                print(f"  ID={addr}: 上电位置 {raw:.2f}° 已设为零点 "
+                      f"(偏置后逻辑角 {JOINT_OFFSETS[addr]:+.0f}°)")
 
     # ── 手腕水平维持 ──
 
