@@ -254,19 +254,34 @@ class Arm:
                 result[addr] = float("nan")
         return result
 
-    def move_joint(self, addr, logical_deg, speed_rpm=10):
-        """单轴移动 (带限位保护)."""
+    def move_joint(self, addr, logical_deg, speed_rpm=10, trapezoid=False,
+                   max_accel_rpm_s=200.0, max_decel_rpm_s=200.0):
+        """单轴移动 (带限位保护).
+
+        trapezoid=True 时使用梯形曲线 (0x26, 平滑加减速), 适合低速/精确运动;
+        否则使用位置+速度前馈 (0x25).
+        """
         lo, hi = JOINT_LIMITS[addr]
         clamped = max(lo, min(hi, logical_deg))
         if clamped != logical_deg:
             print(f"  ID{addr}: {logical_deg:.1f}° 超出限位 [{lo}, {hi}], 截断为 {clamped:.1f}°")
         target = self._to_motor(addr, clamped)
-        self._motors[addr].set_target_position_speed(target, speed_rpm=speed_rpm, wait=False)
+        if trapezoid:
+            self._motors[addr].set_target_position_trapezoidal(
+                target, max_speed_rpm=speed_rpm,
+                max_accel_rpm_s=max_accel_rpm_s,
+                max_decel_rpm_s=max_decel_rpm_s, wait=False)
+        else:
+            self._motors[addr].set_target_position_speed(
+                target, speed_rpm=speed_rpm, wait=False)
 
-    def move_all(self, angles, speed_rpm=10):
+    def move_all(self, angles, speed_rpm=10, trapezoid=False,
+                 max_accel_rpm_s=200.0, max_decel_rpm_s=200.0):
         """多轴同时移动."""
         for addr, deg in angles.items():
-            self.move_joint(addr, deg, speed_rpm=speed_rpm)
+            self.move_joint(addr, deg, speed_rpm=speed_rpm, trapezoid=trapezoid,
+                            max_accel_rpm_s=max_accel_rpm_s,
+                            max_decel_rpm_s=max_decel_rpm_s)
 
     def move_to_polar(self, base_deg, r, speed_rpm=10):
         """移动到极坐标位置 (保持当前Z高度).
@@ -385,7 +400,9 @@ class CartesianArm:
 
     # ── 绝对坐标移动 ──
 
-    def move_to_cartesian(self, x, y, z=None, wait=True, speed_rpm=10.0):
+    def move_to_cartesian(self, x, y, z=None, wait=True, speed_rpm=10.0,
+                          trapezoid=False, max_accel_rpm_s=200.0,
+                          max_decel_rpm_s=200.0):
         """移动到腕部绝对笛卡尔坐标 (X, Y, Z).
 
         内部转换为极坐标 (基座角 θ1, 前伸 r) 后 IK 求解移动 (r<0 约定):
@@ -396,6 +413,8 @@ class CartesianArm:
             z:    Z 高度 (mm), None 时保持当前 Z
             wait: 是否等待到达 (超时 15s)
             speed_rpm: 电机转速
+            trapezoid: 使用梯形曲线 (0x26) 平滑加减速, 适合低速运动
+            max_accel_rpm_s / max_decel_rpm_s: 梯形曲线加减速度 (rpm/s)
 
         Returns:
             target: 目标关节角 {1..4: deg}; 超出限位 / IK 无解时返回 None (未移动)
@@ -420,7 +439,9 @@ class CartesianArm:
 
         self._target["base"], self._target["r"], self._target["z"] = base_deg, r, z
         target = {1: base_deg, 2: id2, 3: id3, 4: id4}
-        self.arm.move_all(target, speed_rpm=speed_rpm)
+        self.arm.move_all(target, speed_rpm=speed_rpm, trapezoid=trapezoid,
+                          max_accel_rpm_s=max_accel_rpm_s,
+                          max_decel_rpm_s=max_decel_rpm_s)
 
         print(f"  目标 → 笛卡尔 X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm  "
               f"(极坐标 基座 {base_deg:+.1f}°  r={r:+.1f}mm)")
@@ -506,11 +527,17 @@ class CartesianArm:
         # 腕部真实坐标 (r_h<0 折叠构型): x = -cosθ1·r_h, y = sinθ1·r_h
         return -math.cos(base_rad) * r_h, math.sin(base_rad) * r_h, z_h
 
-    def move_tool_to(self, x, y, z=None, wait=True, speed_rpm=10.0):
+    def move_tool_to(self, x, y, z=None, wait=True, speed_rpm=10.0,
+                     trapezoid=False, max_accel_rpm_s=200.0,
+                     max_decel_rpm_s=200.0):
         """移动执行器中心到绝对笛卡尔坐标 (X, Y, Z).
 
         执行器中心 = 腕部 + 局部偏移 (TOOL_OFFSET_X=12, TOOL_OFFSET_Y=-36,
         见 tool_center). 流程: tool_to_wrist 转换 → move_to_cartesian.
+
+        Args:
+            trapezoid: 使用梯形曲线 (0x26) 平滑加减速, 适合低速运动
+            max_accel_rpm_s / max_decel_rpm_s: 梯形曲线加减速度 (rpm/s)
 
         Returns:
             target: 目标关节角 {1..4: deg}; 不可达时返回 None (未移动)
@@ -521,7 +548,10 @@ class CartesianArm:
         wx, wy, wz = res
         # y 镜像补偿: move_to_cartesian 的 θ1 = atan2(y, x) 约定使腕部落点为 (wx, -wy),
         # 故传入 (wx, -wy), 实际腕部落在 (wx, wy), 执行器中心正好在 (x, y, z)
-        target = self.move_to_cartesian(wx, -wy, wz, wait=wait, speed_rpm=speed_rpm)
+        target = self.move_to_cartesian(wx, -wy, wz, wait=wait, speed_rpm=speed_rpm,
+                                        trapezoid=trapezoid,
+                                        max_accel_rpm_s=max_accel_rpm_s,
+                                        max_decel_rpm_s=max_decel_rpm_s)
         if target is None:
             return None
         tx, ty, tz = tool_center(target)
@@ -678,6 +708,14 @@ class Esp32Cmd:
     def green_on(self):
         """绿灯常亮."""
         return self.send(LED_GREEN_ON)
+
+    def relay_on(self):
+        """继电器吸合."""
+        return self.send(MAG_ON_CMD)
+
+    def relay_off(self):
+        """继电器断开."""
+        return self.send(MAG_OFF_CMD)
 
     def close(self):
         try:

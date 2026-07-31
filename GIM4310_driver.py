@@ -340,6 +340,8 @@ class Motor:
         max_speed_rpm: float = 100.0,
         max_accel_rpm_s: float = 200.0,
         max_decel_rpm_s: float = 200.0,
+        *,
+        wait: bool = True,
     ) -> dict:
         """梯形曲线绝对值位置控制 (0x26) — 平滑加减速。
 
@@ -348,8 +350,9 @@ class Motor:
             max_speed_rpm:   最大速度 (rpm), 单位 0.01rpm
             max_accel_rpm_s: 最大加速度 (rpm/s), 单位 0.01rpm/s
             max_decel_rpm_s: 最大减速度 (rpm/s), 单位 0.01rpm/s
+            wait:            是否等待应答 (默认 True), False → fire-and-forget
 
-        返回解析后的电机状态 dict。
+        返回解析后的电机状态 dict (wait=True 时)。
         """
         _require_non_negative(max_speed_rpm, "max_speed_rpm")
         _require_non_negative(max_accel_rpm_s, "max_accel_rpm_s")
@@ -359,8 +362,7 @@ class Motor:
         accel = _rpm_to_raw(max_accel_rpm_s)
         decel = _rpm_to_raw(max_decel_rpm_s)
         data = struct.pack("<BiIII", 0x00, encoder_val, speed, accel, decel)
-        raw = self._send(0x26, data)
-        return self._parse_status(raw)
+        return self._command(0x26, data, self._parse_status, wait=wait)
 
     # ── 位置+速度控制 ────────────────────────────────────────────────────────
 
