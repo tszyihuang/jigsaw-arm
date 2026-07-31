@@ -2,11 +2,13 @@
 """四轴机械臂 — 坐标显示 + 键盘控制 + 控制台移动 (极简版)
 
 坐标系: +X=左 +Y=前 +Z=上  (右手定则)
-按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  空格→继电器切换  Q/ESC→退出
+按键: W/S→臂伸缩  A/D→基座旋转  Shift/Ctrl→Z升降  F→继电器切换  Q/ESC→退出
 控制台: 输入增量 <Δ角度°> [Δ前伸mm] [ΔZmm]  例如: 10 100 → 基座+10°, 臂+100mm
+角度: 直接读取编码器多圈角度, 由物理限位保证零点
 """
 
 import math
+import os
 import select
 import sys
 import time
@@ -22,12 +24,42 @@ L1 = 150.0   # 大臂: 肩→肘
 L2 = 150.0   # 小臂: 肘→腕
 L3 = 0.0     # 手部: 腕→末端
 
+# ── 执行器 (末端工具): 中心相对末端电机局部系偏移 ────────────────────────────
+# 末端电机局部系: +x = 沿小臂方向向外, +y = 水平向右 (垂直臂平面), ID4 维持腕部水平
+TOOL_OFFSET_X = 12.0   # 执行器中心: 局部 +x 偏移 (mm)
+TOOL_OFFSET_Y = -36.0  # 执行器中心: 局部 +y 偏移 (mm, 实际为 -36)
+
+# ── 上电偏置检测: 首次读数 > 18° 时, 该电机本会话减去 36° ───────────────────
+BIAS_THRESHOLD  = 18.0    # 首次读取超过该值 (°) 触发修正
+BIAS_CORRECTION = -36.0   # 修正量 (°), 叠加到编码器读数上
+
 # ── 关节限位 (逻辑角度, °) ──────────────────────────────────────────────────
 JOINT_LIMITS  = {1: (-90, 90), 2: (-5, 180), 3: (0, 160), 4: (-120, 120)}  # ID4 自动维持水平
 
 # ── 电机映射: 逻辑角 ↔ 电机绝对角 ──────────────────────────────────────────
 JOINT_SIGNS   = {1: +1, 2: +1, 3: -1, 4: +1}
-JOINT_OFFSETS = {1: 0,  2: 0,  3: 160, 4: 0}
+JOINT_OFFSETS = {1: 0,  2: 0,  3: 160, 4: 24}
+
+
+# ── 摄像头坐标标定: 机械臂水平面 (mm) → 摄像头像素 (px) ────────────────────
+# 线性 (仿射) 变换, 4 组标定点最小二乘拟合 (手动标定, 最大残差 ~5.8 px ≈ 2.3 mm):
+#   臂( 90,  -8.4) → 相机(123,  85)   臂(250, -11) → 相机(544,  95)
+#   臂(100, -120)  → 相机(134, 361)   臂(262, -120) → 相机(538, 365)
+#   u = 2.5634875·x + 0.23176316·y - 100.11222
+#   v = 0.023520676·x - 2.4727018·y + 62.017411
+#  CAMERA_A[0] = u 的 (x, y) 系数, CAMERA_A[1] = v 的 (x, y) 系数, CAMERA_A[2] = 常数项
+CAMERA_A = (
+    ( 2.563487500474e+00,  2.31763156852e-01),
+    ( 2.3520676112e-02,  -2.472701774444e+00),
+    (-1.00112215611229e+02, 6.2017411269669e+01),
+)
+
+
+def arm_to_camera(x, y):
+    """机械臂水平面坐标 (x, y) [mm] → 摄像头像素坐标 (u, v) [px]."""
+    u = CAMERA_A[0][0] * x + CAMERA_A[0][1] * y + CAMERA_A[2][0]
+    v = CAMERA_A[1][0] * x + CAMERA_A[1][1] * y + CAMERA_A[2][1]
+    return u, v
 
 
 # ── 正运动学 (FK) ───────────────────────────────────────────────────────────
@@ -43,6 +75,42 @@ def forward_kinematics(joints):
 
     c1, s1 = math.cos(i1), math.sin(i1)
     return -c1 * r_h, s1 * r_h, z_h
+
+
+# ── 执行器中心 (末端工具) ───────────────────────────────────────────────────
+def tool_center(joints):
+    """关节角度 → 执行器中心坐标 (x, y, z).
+
+    执行器固定于腕部电机 (ID4) 输出端, 局部偏移 (TOOL_OFFSET_X, TOOL_OFFSET_Y):
+    局部 +x = ID4=0° 时沿小臂方向 (臂平面内向外), 局部 +y = 水平向右 (沿 ID4 转轴).
+    ID4 俯仰时 +x 部分在臂平面内随之旋转, +y 部分沿转轴不变.
+    """
+    i1 = math.radians(joints[1])
+    i2 = math.radians(joints[2])
+    i3 = math.radians(joints[3])
+    i4 = math.radians(joints[4])
+
+    fa = i2 + i3                                   # 小臂绝对角
+    r_h = L1 * math.cos(i2) + L2 * math.cos(fa)
+    z_h = L1 * math.sin(i2) + L2 * math.sin(fa)
+
+    c1, s1 = math.cos(i1), math.sin(i1)
+
+    # 末端电机局部系 (ID4=0 时): +x 沿小臂方向, +y 水平向右 (垂直臂平面, 即 ID4 转轴)
+    ox, oy, oz = -c1 * math.cos(fa), s1 * math.cos(fa), math.sin(fa)   # 局部 x
+    rx, ry = s1, c1                                                   # 局部 y (转轴)
+    ux, uy, uz = c1 * math.sin(fa), -s1 * math.sin(fa), math.cos(fa)   # 臂平面内 ⊥小臂
+
+    # ID4 绕局部 y (转轴) 旋转: 局部 x 在臂平面内转动
+    cx, st = math.cos(i4), math.sin(i4)
+    tx = ox * cx + ux * st
+    ty = oy * cx + uy * st
+    tz = oz * cx + uz * st
+
+    x = -c1 * r_h + TOOL_OFFSET_X * tx + TOOL_OFFSET_Y * rx
+    y =  s1 * r_h + TOOL_OFFSET_X * ty + TOOL_OFFSET_Y * ry
+    z =  z_h      + TOOL_OFFSET_X * tz
+    return x, y, z
 
 
 # ── 逆运动学 (IK, 臂平面内) ────────────────────────────────────────────────
@@ -81,8 +149,8 @@ class Arm:
     def __init__(self, port=SERIAL_PORT, baudrate=BAUDRATE):
         self._bus = MotorBus(port=port, addresses=[1, 2, 3, 4], baudrate=baudrate)
         self._motors = {m.address: m for m in self._bus.motors}
-        self._origins = {}
-        self._wrist_level_ref = None  # 手腕水平参考角 (deg), 校准后设定
+        self._bias = {addr: 0.0 for addr in self._motors}
+        self._wrist_level_ref = None  # 手腕水平参考角 (deg), 上电时设定
 
         for m in self._bus.motors:
             try:
@@ -92,38 +160,38 @@ class Arm:
             time.sleep(0.002)
         time.sleep(0.1)
 
-    # ── 原点标定 ──
+        self._detect_bias()
 
-    def calibrate(self):
-        """标定原点 — 请先将机械臂摆成蜷缩姿态:
-        ID1=0 (基座居中), ID2=0 (大臂水平), ID3=160° (肘完全弯折), ID4=0"""
-        print("原点标定中... 请保持蜷缩姿态")
-        samples = {addr: [] for addr in self._motors}
+    # ── 上电编码器偏置检测 ──
 
-        for _ in range(10):
-            for addr, m in self._motors.items():
-                try:
-                    samples[addr].append(m.read_status()["multi_turn_deg"])
-                except Exception:
-                    pass
-            time.sleep(0.03)
+    def _detect_bias(self):
+        """首次读取编码器: 读数 > BIAS_THRESHOLD 的电机, 本会话角度减去修正量.
 
-        for addr, vals in samples.items():
-            if not vals:
-                raise RuntimeError(f"电机 ID={addr} 标定失败: 无有效读数")
-            self._origins[addr] = sum(vals) / len(vals)
-            print(f"  ID={addr}: origin = {self._origins[addr]:.2f}°")
-        print("标定完成\n")
+        仅软件修正读数, 不移动电机; 补偿上电时多圈计数跳变.
+        """
+        for addr in self._motors:
+            try:
+                raw = self._motors[addr].read_status()["multi_turn_deg"]
+            except Exception:
+                raw = float("nan")
+            if math.isnan(raw):
+                print(f"  ID={addr}: 首次读取失败, 不修正")
+            elif raw > BIAS_THRESHOLD:
+                self._bias[addr] = BIAS_CORRECTION
+                print(f"  ID={addr}: 首次读数 {raw:.2f}° > {BIAS_THRESHOLD:.0f}°, "
+                      f"本会话减去 {abs(BIAS_CORRECTION):.0f}°")
+            else:
+                print(f"  ID={addr}: 首次读数 {raw:.2f}°, 无需修正")
 
     # ── 手腕水平维持 ──
 
     def set_wrist_level_ref(self):
-        """记录当前手腕绝对角度为水平参考。
-        此后手腕将自动维持该角度 (相对于水平面平行)。"""
+        """设定手腕水平参考: 硬编码水平时 ID4 = 24° (逻辑角), 锚定当前肩/肘姿态。
+        此后手腕将自动维持该姿态 (相对于水平面平行)。"""
         joints = self.get_joints()
-        # 臂平面内手腕绝对角 = 肩 + 肘 + 腕
-        self._wrist_level_ref = joints[2] + joints[3] + joints[4]
-        print(f"手腕水平参考角: {self._wrist_level_ref:.2f}°")
+        # 臂平面内手腕绝对角 = 肩 + 肘 + 腕;  24° 是 ID4 的水平角, 不是绝对角
+        self._wrist_level_ref = joints[2] + joints[3] + 24.0
+        print(f"手腕水平参考角: {self._wrist_level_ref:.2f}° (ID4 水平位 = 24°)")
         return self._wrist_level_ref
 
     def get_wrist_target(self, id2, id3):
@@ -137,10 +205,10 @@ class Arm:
     # ── 角度转换 ──
 
     def _to_logical(self, addr, motor_deg):
-        return JOINT_OFFSETS[addr] + JOINT_SIGNS[addr] * (motor_deg - self._origins[addr])
+        return JOINT_OFFSETS[addr] + JOINT_SIGNS[addr] * (motor_deg + self._bias[addr])
 
     def _to_motor(self, addr, logical_deg):
-        return self._origins[addr] + JOINT_SIGNS[addr] * (logical_deg - JOINT_OFFSETS[addr])
+        return JOINT_SIGNS[addr] * (logical_deg - JOINT_OFFSETS[addr]) - self._bias[addr]
 
     # ── 关节读写 ──
 
@@ -233,12 +301,26 @@ ESP32_VENDOR_HINTS = {
     0x303A,  # Espressif 原生 USB (ESP32-S2/S3/C3)
 }
 
+# 精确 PID 提示: FT232R (单通道 UART, 0403:6001).
+# 仅按 VID=0x0403 匹配会误选 FT4232H 四通道 (0403:6011, 电机总线所在).
+ESP32_PID_HINTS = {
+    0x6001,  # FT232R — 本机 ESP32 用的转接芯片
+}
+
+# ESP32 的 by-id 固定路径 (唯一序列号, 插拔/重启后不变), 最高优先级
+RELAY_SERIAL_BY_ID = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0"
+
 
 def detect_esp32_port():
-    """自动检测 ESP32 所在串口 (优先 VID 匹配, 其次唯一串口), 找不到返回 None."""
+    """检测 ESP32 所在串口, 找不到返回 None.
+
+    优先级: by-id 固定路径 → 精确 PID (FT232R) → 唯一串口.
+    """
+    if os.path.exists(RELAY_SERIAL_BY_ID):
+        return RELAY_SERIAL_BY_ID
     ports = serial.tools.list_ports.comports()
     for p in ports:
-        if p.vid in ESP32_VENDOR_HINTS:
+        if p.vid in ESP32_VENDOR_HINTS and p.pid in ESP32_PID_HINTS:
             return p.device
     if len(ports) == 1:
         return ports[0].device
@@ -250,7 +332,7 @@ class Relay:
 
     def __init__(self, port, initial_off=True):
         self._on = False
-        self._ser = serial.Serial(port, RELAY_BAUDRATE, timeout=0.1)
+        self._ser = serial.Serial(port, RELAY_BAUDRATE, timeout=2.0)   # ESP32 回复延迟 ~1s
         time.sleep(1.0)                   # 等 ESP32 启动
         self._ser.reset_input_buffer()    # 丢弃 ESP32 启动信息
         if initial_off:
@@ -263,6 +345,10 @@ class Relay:
     def set(self, on):
         cmd = MAG_ON_CMD if on else MAG_OFF_CMD
         self._ser.write((cmd + "\n").encode("utf-8"))
+        self._ser.flush()
+        reply = self._ser.readline().decode("utf-8", errors="replace").strip()
+        if not reply:
+            print(f"  ⚠ 继电器无回复: {cmd} — 可能串口不是 ESP32")
         self._on = on
 
     def toggle(self):
@@ -291,9 +377,7 @@ def main():
     STEP_DEG = 2.0   # 旋转步长 (°)
 
     with Arm(port=args.port, baudrate=args.baud) as arm:
-        arm.calibrate()
-
-        # 记录当前手腕角度为水平参考 (此后手腕自动维持水平)
+        # 手腕水平参考: ID4 水平角硬编码 24°, 锚定当前肩/肘姿态 (此后手腕自动维持水平)
         arm.set_wrist_level_ref()
 
         # 从当前实际位置初始化目标状态
@@ -305,26 +389,31 @@ def main():
         r_target = math.hypot(x0, y0)       # 径向距离
         z_target = z0
 
+        tx0, ty0, tz0 = tool_center(joints)
+        cu0, cv0 = arm_to_camera(tx0, ty0)
         print(f"初始: X={x0:.1f} Y={y0:.1f} Z={z0:.1f}  "
-              f"ID1={id1_target:.1f}°")
+              f"执行器中心 X={tx0:.1f} Y={ty0:.1f} Z={tz0:.1f}  "
+              f"相机 U={cu0:6.1f} V={cv0:6.1f}  "
+              f"ID1={joints[1]:.1f}° ID2={joints[2]:.1f}° "
+              f"ID3={joints[3]:.1f}° ID4={joints[4]:.1f}°")
 
-        # ── 继电器 (空格切换通断) ──
+        # ── 继电器 (F 切换通断) ──
         relay = None
         esp_port = args.relay_port or detect_esp32_port()
         if esp_port:
             try:
                 relay = Relay(esp_port)
-                print(f"继电器已连接: {esp_port}  (按 空格 切换通断)")
+                print(f"继电器已连接: {esp_port}  (按 F 切换通断)")
             except Exception as e:
-                print(f"⚠ 继电器连接失败: {e} — 空格键不可用")
+                print(f"⚠ 继电器连接失败: {e} — F 键不可用")
         else:
-            print("⚠ 未检测到 ESP32, 空格键不可用 (可用 --relay-port 指定)")
+            print("⚠ 未检测到 ESP32, F 键不可用 (可用 --relay-port 指定)")
 
-        space_pending = [False]   # 空格按下待处理 (回调线程置位, 主循环消费)
+        f_pending = [False]   # F 按下待处理 (回调线程置位, 主循环消费)
 
         def _on_key(e):
-            if e.name == "space":
-                space_pending[0] = True
+            if e.name == "f":
+                f_pending[0] = True
 
         keyboard.on_press(_on_key)
 
@@ -338,9 +427,9 @@ def main():
                     print("\n退出")
                     break
 
-                # ── 继电器切换: 空格 ──
-                if space_pending[0]:
-                    space_pending[0] = False
+                # ── 继电器切换: F ──
+                if f_pending[0]:
+                    f_pending[0] = False
                     if relay:
                         on = relay.toggle()
                         print(f"\n继电器 {'吸合 ON' if on else '断开 OFF'} "
@@ -406,12 +495,17 @@ def main():
                     last_status = now
                     joints = arm.get_joints()
                     ax, ay, az = forward_kinematics(joints)
+                    tx, ty, tz = tool_center(joints)
+                    cu, cv = arm_to_camera(tx, ty)
 
                     mag = "ON" if (relay and relay.is_on) else "OFF"
                     print(f"\r实际 X={ax:+8.1f} Y={ay:+8.1f} Z={az:+8.1f}  |  "
-                          f"目标 角度={id1_target:+7.1f}° r={r_target:+7.1f}mm Z={z_target:+7.1f}mm  |  "
-                          f"J1={joints[1]:+7.1f} J2={joints[2]:+7.1f} J3={joints[3]:+7.1f} J4={joints[4]:+7.1f}"
-                          f"  |  MAG={mag}",
+                          f"ID1={joints[1]:+7.1f}° ID2={joints[2]:+7.1f}° "
+                          f"ID3={joints[3]:+7.1f}° ID4={joints[4]:+7.1f}°  |  "
+                          f"目标 r={r_target:+7.1f}mm Z={z_target:+7.1f}mm  |  "
+                          f"MAG={mag}  |  "
+                          f"执行器 X={tx:+8.1f} Y={ty:+8.1f} Z={tz:+8.1f}  |  "
+                          f"相机 U={cu:6.1f} V={cv:6.1f}",
                           end="", flush=True)
                 elif not dirty:
                     time.sleep(0.005)   # 空闲时让出 CPU, 按键轮询仍保持 ~200 Hz
