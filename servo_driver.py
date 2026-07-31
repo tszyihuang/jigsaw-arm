@@ -1,6 +1,11 @@
 import serial
 import time
 
+# ── 配置 ─────────────────────────────────────────────────────────────────────
+SERVO_PORT = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"  # 稳定 by-id 路径, 防 USB 枚举顺序变化
+SERVO_STEP_PER_DEG = 4095 / 360   # 每度对应的步数
+SERVO_SPEED = 500                 # 常用转动速度
+
 # ================= Feetech STS/SCS 串口舵机驱动 (ID=1) =================
 class FeetechSTSServo:
     """Feetech STS/SCS 系列串口舵机底层驱动（半双工 TTL, 1Mbps, ID=1）"""
@@ -77,6 +82,19 @@ class FeetechSTSServo:
 
         self.ser.write(bytearray(packet))
 
+    def move_relative_deg(self, delta_deg, target_speed=2000):
+        """相对当前角度偏转 (度), 正=逆时针, 负=顺时针 — 与当前位置无关.
+
+        读取当前角度, 叠加偏转量后取模 4096 (可连续多圈), 再发绝对位置指令.
+        返回新位置 (0-4095), 读取失败时返回 None.
+        """
+        pos, _ = self.read_position()
+        if pos is None:
+            return None
+        new_pos = (pos - int(delta_deg * SERVO_STEP_PER_DEG)) % 4096
+        self.move_to(new_pos, target_speed=target_speed)
+        return new_pos
+
     def set_torque_limit(self, torque_value):
         """扭矩限制, 0-1000"""
         if not self.is_open:
@@ -94,6 +112,26 @@ class FeetechSTSServo:
         checksum = (~checksum_sum) & 0xFF
 
         packet = [0xFF, 0xFF, self.SERVO_ID, length, instruction, address, torque_l, torque_h, checksum]
+        self.ser.write(bytearray(packet))
+        time.sleep(0.005)
+
+    def disable_torque(self):
+        """关闭扭矩 (失能) — 写扭矩开关寄存器 (0x31) = 0.
+
+        舵机失去保持力, 可自由转动. 程序退出前应调用, 防止舵机持续通电保持.
+        """
+        if not self.is_open:
+            return
+
+        length      = 0x04
+        instruction = 0x03  # WRITE
+        address     = 0x31  # 扭矩开关
+        data        = 0x00  # 0 = 关闭扭矩
+
+        checksum_sum = (self.SERVO_ID + length + instruction + address + data)
+        checksum = (~checksum_sum) & 0xFF
+
+        packet = [0xFF, 0xFF, self.SERVO_ID, length, instruction, address, data, checksum]
         self.ser.write(bytearray(packet))
         time.sleep(0.005)
 
@@ -182,19 +220,26 @@ class FeetechSTSServo:
             return None, None
 
     def close(self):
+        """关闭串口前先关闭舵机扭矩 (失能), 保证程序退出后舵机自由不发热."""
         if self.ser and self.ser.is_open:
+            try:
+                self.disable_torque()
+            except Exception:
+                pass  # 串口异常时忽略, 仍尝试关闭串口
             self.ser.close()
             print("[INFO] 串口已关闭")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 # ================= 调用示例 =================
 if __name__ == "__main__":
-    import signal
-    import sys
-
-    STEP_PER_DEG = 4095 / 360  # 每度对应的步数
-
-    servo = FeetechSTSServo(port="/dev/ttyUSB0", debug=False)
+    servo = FeetechSTSServo(port=SERVO_PORT, debug=False)
 
     if not servo.is_open:
         print("=== 串口连接失败 ===")
@@ -205,44 +250,41 @@ if __name__ == "__main__":
         servo.close()
         exit(1)
 
-    # 读取原位
+    # 读取当前位置
     pos, _ = servo.read_position()
     if pos is None:
         print("[ERROR] 无法读取当前位置")
         servo.close()
         exit(1)
 
-    home_pos = pos
-    home_deg = home_pos / STEP_PER_DEG
-    left_pos = home_pos - int(60 * STEP_PER_DEG)  # 左移 60°
-
-    print(f"原位={home_pos} ({home_deg:.1f}°), "
-          f"左移目标={left_pos} ({left_pos/STEP_PER_DEG:.1f}°), "
-          f"速度=500")
-    print("按 Ctrl+C 停止\n")
-
-    def cleanup(_sig, _frame):
-        print("\n回中并退出...")
-        servo.move_to(home_pos, target_speed=500)
-        time.sleep(0.5)
-        servo.close()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, cleanup)
+    print(f"舵机在线, 当前位置 = {pos} ({pos/SERVO_STEP_PER_DEG:.1f}°)")
+    print("输入相对偏转角度: +50 → 逆时针 50°, -30 → 顺时针 30° "
+          "(与当前位置无关), q 退出\n")
 
     try:
         while True:
-            # 缓慢左移 60°
-            print(f"← 左移中...", end=" ", flush=True)
-            servo.move_to(left_pos, target_speed=500)
-            time.sleep(2.0)
+            try:
+                line = input("> ").strip()
+            except EOFError:
+                print()
+                break
+            if not line:
+                continue
+            if line.lower() in ("q", "quit", "exit"):
+                break
+            try:
+                delta_deg = float(line)
+            except ValueError:
+                print("  ⚠ 请输入数字角度, 例如 +50 或 -30")
+                continue
 
-            # 回到原位
-            print(f"→ 回原位...", end=" ", flush=True)
-            servo.move_to(home_pos, target_speed=500)
-            time.sleep(2.0)
-
-            print("完成一轮")
-
+            new_pos = servo.move_relative_deg(delta_deg, target_speed=500)
+            if new_pos is None:
+                print("  ⚠ 读取当前位置失败, 未移动")
+            else:
+                print(f"  ✓ {delta_deg:+.0f}° → 新位置 {new_pos} "
+                      f"({new_pos/SERVO_STEP_PER_DEG:.1f}°)")
     except KeyboardInterrupt:
-        cleanup(None, None)
+        print()
+    finally:
+        servo.close()   # close 时自动关闭扭矩 (失能)

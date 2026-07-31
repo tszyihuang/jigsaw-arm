@@ -11,6 +11,7 @@
        n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
        action             下降到 Z_DOWN → 继电器吸合 → Z 回升到 0 (抓取)
        put                下降到 Z_DOWN → 继电器释放 → Z 回升到 0 (放下)
+       r <角度>           舵机相对转动, 正=逆时针 (如: r 50, r -30)
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
        status              显示当前位置     ? / help → 本帮助
@@ -30,6 +31,8 @@ import sys
 import time
 
 from arm_driver import CartesianArm, Esp32Cmd, detect_esp32_port
+from servo_driver import (FeetechSTSServo, SERVO_PORT,
+                          SERVO_STEP_PER_DEG, SERVO_SPEED)
 
 # ── 待机位置 (实际笛卡尔坐标, mm) ───────────────────────────────────────────
 STANDBY_X = -9.0
@@ -64,6 +67,22 @@ class MainLogic:
                 print(f"⚠ ESP32 连接失败: {e} — 红灯指令不可用")
         else:
             print("⚠ 未检测到 ESP32 — 红灯指令不可用 (可用 --esp-port 指定)")
+
+        # ── 舵机 (Feetech STS/SCS) ──
+        self.servo = None
+        try:
+            self.servo = FeetechSTSServo(SERVO_PORT)
+            if not (self.servo.is_open and self.servo.is_online()):
+                print("⚠ 舵机未应答 — r 指令不可用")
+                self.servo.close()
+                self.servo = None
+            else:
+                pos, _ = self.servo.read_position()
+                print(f"舵机已连接: {SERVO_PORT} "
+                      f"(位置 {pos} ≈ {pos / SERVO_STEP_PER_DEG:.1f}°)")
+        except Exception as e:
+            print(f"⚠ 舵机连接失败: {e} — r 指令不可用")
+            self.servo = None
 
     # ── 启动流程 ──
 
@@ -153,6 +172,7 @@ class MainLogic:
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
         print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
+        print("           r <角度>            → 舵机相对转动, 正=逆时针 (如: r 50, r -30)")
         print("           status             → 显示当前位置     ? / help → 本帮助")
         print("  例: 90 0      → 移动到 (X=90,  Y=0)")
         print("      100 50 80 → 移动到 (X=100, Y=50, Z=80)")
@@ -215,6 +235,26 @@ class MainLogic:
         if parts[0] in ("put", "place"):
             self._run_action(mag_on=False)
             return
+        if parts[0] in ("r", "servo"):
+            if not self.servo:
+                print("  ⚠ 舵机未连接, r 指令不可用")
+                return
+            if len(parts) < 2:
+                print("  ⚠ 请输入偏转角度, 例如: r 50 (逆时针 50°) 或 r -30")
+                return
+            try:
+                delta_deg = float(parts[1])
+            except ValueError:
+                print("  ⚠ 角度格式错误, 例如: r 50 或 r -30")
+                return
+            new_pos = self.servo.move_relative_deg(delta_deg,
+                                                   target_speed=SERVO_SPEED)
+            if new_pos is None:
+                print("  ⚠ 读取舵机当前位置失败, 未移动")
+            else:
+                print(f"  ✓ 舵机 {delta_deg:+.0f}° → "
+                      f"新位置 {new_pos} ({new_pos / SERVO_STEP_PER_DEG:.1f}°)")
+            return
         if parts[0] in ("n", "cam"):
             try:
                 vals = [float(p) for p in parts[1:]]
@@ -254,6 +294,11 @@ class MainLogic:
                 self.esp.close()          # 熄灭红灯
             except Exception as e:
                 print(f"ESP32 close 失败: {e}")
+        if self.servo:
+            try:
+                self.servo.close()        # 关闭时自动失能扭矩
+            except Exception as e:
+                print(f"舵机 close 失败: {e}")
         self.arm.close()                  # 失能电机并关闭总线
 
     def __enter__(self):
