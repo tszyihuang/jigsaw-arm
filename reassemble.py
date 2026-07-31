@@ -306,12 +306,15 @@ def force_max_vertices(pts, max_vertices=5):
     return pts
 
 
-def masks_from_yolo(results, num_fragments=4, epsilon=0.04):
+def masks_from_yolo(results, num_fragments=4, epsilon=0.02):
     """从 YOLOv8 推理结果中提取多边形顶点列表。
 
-    epsilon: 轮廓近似精度（与 infer.py 显示路径的 APPROX_EPSILON=0.04 一致，
-    避免同一 mask 在显示端和拼接端得到不同顶点数）。
-    顶点数超过 5 的多边形会被 force_max_vertices 强制缩到 5 个。
+    epsilon: 轮廓近似精度 (与 infer.py 显示路径的 APPROX_EPSILON=0.02 一致,
+    避免同一 mask 在显示端和拼接端得到不同顶点数). 注意 0.04 会把小角
+    过度简化 (实测同帧出现 4 顶点 vs 3 顶点, 质心偏差 7.6px), 已改回 0.02.
+    与显示路径 (infer.mask_to_polygon_pts) 同样先做 127 阈值二值化,
+    保证同一 mask 提取出完全相同的多边形.
+    顶点数超过 5 的多边形会被 force_max_vertices 强制缩到 5 个.
     """
     r = results[0]
     if r.masks is None:
@@ -327,6 +330,7 @@ def masks_from_yolo(results, num_fragments=4, epsilon=0.04):
         m = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
         if m.shape != (h, w):
             m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:

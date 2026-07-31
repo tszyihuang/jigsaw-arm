@@ -36,7 +36,7 @@ VERTEX_COLOR = (0, 0, 255)  # 顶点颜色 (红色)
 VERTEX_THICKNESS = -1       # 填充圆点
 EDGE_COLOR = (0, 255, 255)  # 多边形边颜色 (黄色)
 EDGE_THICKNESS = 2
-APPROX_EPSILON = 0.03       # 轮廓近似精度（越小顶点越多，越大越简化）
+APPROX_EPSILON = 0.02      # 轮廓近似精度（越小顶点越多，越大越简化）
 
 # ===== 几何中心点配置 =====
 CENTROID_RADIUS = 3        # 中心点半径
@@ -45,7 +45,7 @@ CENTROID_THICKNESS = -1     # 填充圆点
 
 # ===== 顶点时域平滑配置 =====
 SMOOTH_ALPHA = 0.3         # EMA 平滑系数 (0~1, 越小越平滑但延迟越大)
-MAX_MATCH_DIST = 50        # 帧间顶点/轨迹匹配的最大距离 (像素)
+MAX_MATCH_DIST = 20       # 帧间顶点/轨迹匹配的最大距离 (像素)
 MAX_LOST_FRAMES = 10       # 目标丢失后轨迹保留的帧数
 
 # ===== 单帧流程 (启动识别 / read) 的时域平滑 =====

@@ -60,12 +60,12 @@ SERVO_BASE_COMP_GAIN = -1.0
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
 ACTION_Z_DOWN = -41.0   # ① 下降到该高度
-ACTION_Z_UP   =   -20.0   # ④ 动作结束后 Z 回升到该高度
+ACTION_Z_UP   =   -30.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
 ACTION_SPEED_RPM = 3.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
-ACTION_ID3_DELAY = 0.5   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
-ACTION_ID4_DELAY = 0.5   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
+ACTION_ID3_DELAY = 0.1   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
+ACTION_ID4_DELAY = 0.1   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
 TRANS_V_OFFSET = -400.0  # 放置点 V = 抓取点 V - 400 
