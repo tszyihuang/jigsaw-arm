@@ -20,7 +20,7 @@ MODEL_PATH = "/home/jetson/Desktop/vision/runs/segment_fragment_n/weights/best.p
 CAMERA_INDEX = 0
 WIDTH, HEIGHT = 640, 480
 FPS = 60
-CONF_THRESH = 0.8
+CONF_THRESH = 0.5
 
 WINDOW_NAME = "YOLO Seg - GPU"
 COMBINED_WINDOW_NAME = "Combined View"
