@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """四轴机械臂 — 坐标显示 + 键盘控制 + 控制台移动 (极简版)
 
 坐标系: +X=左 +Y=前 +Z=上  (右手定则)
@@ -576,6 +576,7 @@ MAG_ON_CMD = "mag_high"    # 吸合
 MAG_OFF_CMD = "mag_low"    # 断开
 LED_RED_ON  = "red_on"     # 红灯亮
 LED_RED_OFF = "red_off"    # 红灯灭
+LED_GREEN_ON = "green_on"  # 绿灯常亮
 ESP32_VENDOR_HINTS = {
     0x10C4,  # Silicon Labs CP210x
     0x1A86,  # QinHeng CH340/CH341
@@ -673,6 +674,10 @@ class Esp32Cmd:
     def red_off(self):
         """红灯灭."""
         return self.send(LED_RED_OFF)
+
+    def green_on(self):
+        """绿灯常亮."""
+        return self.send(LED_GREEN_ON)
 
     def close(self):
         try:

@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """机械臂主逻辑 — 启动流程 + 控制台绝对笛卡尔控制 (执行器中心坐标)
 
 启动后:
   1. 机械臂移动到待机位置 (实际笛卡尔坐标 X=-9, Y=0, Z=+80 mm)
   2. 向 ESP32 发送 red_on, 红灯亮起, 并保持待机
-  3. 控制台输入指令移动机械臂 (坐标对应执行器中心, 含 TOOL_OFFSET 偏移):
+  3. 开启摄像头目标识别 (YOLO, 见 infer.py): 检测到目标后打印中心点
+     像素坐标一次, 并将 ESP32 灯光切换为绿色常亮
+  4. 控制台输入指令移动机械臂 (坐标对应执行器中心, 含 TOOL_OFFSET 偏移):
        <Xmm> <Ymm> [Zmm]   绝对笛卡尔坐标, Z 缺省保持当前
        n <u> <v> [Zmm]     摄像头像素坐标, 线性变换为执行器坐标后移动
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
@@ -62,12 +64,48 @@ class MainLogic:
         else:
             print("⚠ ESP32 未连接, 跳过 red_on")
 
+    def detect_target(self):
+        """目标识别: 开启摄像头等待检测, 打印中心点坐标一次, 灯光切换绿色常亮."""
+        print("── 目标识别 ──")
+        try:
+            import infer
+        except Exception as e:
+            print(f"⚠ 无法加载目标识别模块: {e}")
+            return
+        try:
+            model = infer.load_model()
+            cap = infer.open_camera()
+            if cap is None:
+                print("⚠ 无法打开摄像头, 跳过目标识别")
+                return
+            try:
+                res = infer.detect_first_target(model, cap)
+            finally:
+                cap.release()
+            if res is None:
+                print("⚠ 未检测到目标")
+                return
+            cx, cy, cls = res
+            print(f"  ✓ 检测到目标 [{cls}], 中心点像素坐标 (u={cx}, v={cy})")
+            if self.esp:
+                self.esp.red_off()
+                self.esp.green_on()
+                print("  ✓ 灯光已切换为绿色常亮")
+            else:
+                print("⚠ ESP32 未连接, 跳过绿灯")
+        except KeyboardInterrupt:
+            print("⚠ 目标识别被中断, 跳过")
+        except Exception as e:
+            print(f"⚠ 目标识别失败: {e}")
+
     def run(self):
-        """主逻辑入口 — 启动完成后进入控制台控制循环."""
+        """主逻辑入口 — 启动 → 目标识别 → 控制台控制循环."""
         self.startup()
 
         print(f"\n✓ 启动完成: 机械臂待机 (X={STANDBY_X:.0f}, Y={STANDBY_Y:.0f}, "
               f"Z={STANDBY_Z:.0f}), 红灯亮")
+        self.detect_target()
+
         self._print_usage()
         print("按 Ctrl+C 退出")
 

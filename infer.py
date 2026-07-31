@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """YOLOv8 实时实例分割 — GPU 推理"""
 
 import cv2
@@ -135,6 +135,29 @@ class VertexSmoother:
         return smoothed
 
 
+def mask_to_polygon_pts(mask_tensor, image_shape):
+    """mask 张量 → 最大轮廓的多边形近似顶点列表 (与显示/检测共用).
+
+    与 draw_contour_polygon_vertices 使用同一套提取逻辑: 二值化 →
+    最大轮廓 → 多边形近似 (保留凹形边界). 顶点数不足 3 时返回 None.
+    """
+    mask = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
+    if mask.shape != image_shape[:2]:
+        mask = cv2.resize(mask, (image_shape[1], image_shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+    _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
+    if len(approx) < 3:
+        return None
+    return [tuple(p[0]) for p in approx]
+
+
 def draw_contour_polygon_vertices(image, masks_data, smoother=None, class_ids=None):
     """
     从 YOLO mask 数据中提取多边形顶点（支持凹多边形）并绘制到图像上。
@@ -150,35 +173,9 @@ def draw_contour_polygon_vertices(image, masks_data, smoother=None, class_ids=No
 
     for _i, mask_tensor in enumerate(masks_data.data):
         # mask_tensor: (H, W) 的 float tensor，值 0~1
-        mask = (mask_tensor.cpu().numpy() * 255).astype(np.uint8)
-
-        # 调整 mask 尺寸以匹配图像
-        if mask.shape != image.shape[:2]:
-            mask = cv2.resize(mask, (image.shape[1], image.shape[0]),
-                              interpolation=cv2.INTER_NEAREST)
-
-        # 二值化
-        _, binary = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-
-        # 查找轮廓
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        raw_pts = mask_to_polygon_pts(mask_tensor, image.shape)
+        if raw_pts is None:
             continue
-
-        # 取最大轮廓
-        cnt = max(contours, key=cv2.contourArea)
-
-        # 多边形近似（保留凹形边界）
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, APPROX_EPSILON * peri, True)
-
-        # 顶点数过少则跳过
-        if len(approx) < 3:
-            continue
-
-        # 原始顶点 (保留凹形边界)
-        raw_pts = [tuple(p[0]) for p in approx]
 
         # --- 时域平滑 ---
         if smoother is not None:
@@ -210,32 +207,102 @@ def draw_contour_polygon_vertices(image, masks_data, smoother=None, class_ids=No
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, CENTROID_COLOR, 1)
 
 
-def main():
-    # --- 加载模型到 GPU ---
-    print(f"加载模型: {MODEL_PATH}")
+def load_model(path=MODEL_PATH):
+    """加载 YOLO 模型到 GPU (无 GPU 时回退 CPU)."""
+    print(f"加载模型: {path}")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"设备: {device}")
-    model = YOLO(MODEL_PATH)
+    model = YOLO(path)
     model.to(device)
+    return model
 
-    # --- 打开摄像头 ---
-    dev = CAMERA_INDEX
-    gst_pipe = build_gst_pipeline(dev, WIDTH, HEIGHT, FPS)
-    print(f"[GStreamer] {gst_pipe}")
 
-    cap = cv2.VideoCapture(gst_pipe, cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        print(f"/dev/video{dev} 打不开，尝试 /dev/video1 ...")
-        dev = 1
-        gst_pipe = build_gst_pipeline(dev, WIDTH, HEIGHT, FPS)
+def open_camera(cam_idx=CAMERA_INDEX, width=WIDTH, height=HEIGHT, fps=FPS):
+    """打开摄像头: GStreamer 管道优先, 失败回退默认后端 (V4L2), 再失败回退 /dev/video1.
+
+    注: 部分环境 OpenCV 未编译 GStreamer 支持, 此时默认后端是唯一可用路径
+    (默认后端下强制 MJPG + 目标分辨率以保持帧率).
+
+    Returns:
+        VideoCapture; 都打不开时返回 None.
+    """
+    for idx in (cam_idx, 1):
+        if idx != cam_idx:
+            print(f"/dev/video{cam_idx} 打不开，尝试 /dev/video1 ...")
+        gst_pipe = build_gst_pipeline(idx, width, height, fps)
+        print(f"[GStreamer] {gst_pipe}")
         cap = cv2.VideoCapture(gst_pipe, cv2.CAP_GSTREAMER)
         if not cap.isOpened():
-            print("无法打开摄像头。")
-            sys.exit(1)
+            print(f"GStreamer 打不开，尝试默认后端 /dev/video{idx} ...")
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if cap.isOpened():
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"摄像头: /dev/video{idx}  {actual_w}x{actual_h}")
+            return cap
+    print("无法打开摄像头。")
+    return None
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"摄像头: /dev/video{dev}  {actual_w}x{actual_h}")
+
+def detect_first_target(model, cap, max_frames=None):
+    """循环推理, 检测到第一个目标时返回其中心点像素坐标与类别名.
+
+    中心点 = 面积最大的 mask 轮廓多边形近似的几何中心 (与显示逻辑一致,
+    见 mask_to_polygon_pts / polygon_centroid).
+
+    Args:
+        model: 已加载的 YOLO 模型 (load_model 返回值)
+        cap:   已打开的 VideoCapture (open_camera 返回值)
+        max_frames: 最多读取帧数, None 表示无限等待
+
+    Returns:
+        (cx, cy, class_name); 未检测到 (或 max_frames 耗尽 / 读帧失败) 时返回 None.
+    """
+    frames = 0
+    while max_frames is None or frames < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            print("读取帧失败")
+            return None
+        results = model(frame, verbose=False, conf=CONF_THRESH, half=True)
+        masks = results[0].masks
+        if masks is not None and len(masks) > 0:
+            # 类别 ID 在 boxes.cls 上 (与 masks.data 同序对应), Masks 自身无 cls 属性
+            boxes = results[0].boxes
+            cls_ids = boxes.cls if boxes is not None else None
+            best_area = -1.0
+            best = None
+            for mi, mask_tensor in enumerate(masks.data):
+                pts = mask_to_polygon_pts(mask_tensor, frame.shape)
+                if pts is None:
+                    continue
+                area = cv2.contourArea(np.array(pts))
+                if area > best_area:
+                    best_area = area
+                    if cls_ids is not None and mi < len(cls_ids):
+                        cls = results[0].names[int(cls_ids[mi])]
+                    else:
+                        cls = "unknown"
+                    best = polygon_centroid(pts), cls
+            if best is not None:
+                (cx, cy), cls = best
+                return cx, cy, cls
+        del results
+        frames += 1
+    return None
+
+
+def main():
+    model = load_model()
+
+    # --- 打开摄像头 ---
+    cap = open_camera()
+    if cap is None:
+        sys.exit(1)
     screenshots_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
     os.makedirs(screenshots_dir, exist_ok=True)
     print("按 q 退出 | 空格/s 截图 | r 拼接 | t 平滑开关\n")
