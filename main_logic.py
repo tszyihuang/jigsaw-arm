@@ -23,6 +23,7 @@
                           角度=旋转角
        例: 90 0 → 执行器中心移动到 (X=90, Y=0)
        home / standby      回到待机位置 (X=-9, Y=0, Z=80)
+       ready              移动到准备位置 (执行器 X=175.3, Y=-35.3, Z=47.6)
        status              显示当前位置     ? / help → 本帮助
 
 所有机械臂运动学/控制 (极坐标换算、IK、执行器偏移、目标状态跟踪) 均在
@@ -50,6 +51,12 @@ STANDBY_Z = 60.0
 
 STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 
+# ── ready 准备位置 (执行器中心坐标, mm) ─────────────────────────────────────
+READY_X = 175.3
+READY_Y = -35.3
+READY_Z = 47.6
+READY_SPEED_RPM = 10.0   # 移动到 ready 位置的转速 (rpm)
+
 # ── 基座旋转 → 舵机反向补偿 ────────────────────────────────────────────────
 # 电机1 (基座) 旋转 Δ° 后, 舵机自动反向旋转补偿, 抵消基座转动对工具姿态的
 # 影响 (保持抓取物方向不变). 方向推导: 基座角增大 = 从上方 (摄像头视角) 看
@@ -59,17 +66,17 @@ STANDBY_SPEED_RPM = 10.0   # 待机移动转速 (rpm)
 SERVO_BASE_COMP_GAIN = -1.0
 
 # ── action 动作序列参数 (执行器中心 Z, mm) ────────────────────────────────
-ACTION_Z_DOWN = -39.0   # ① 下降到该高度
-ACTION_Z_UP   =   -20.0   # ④ 动作结束后 Z 回升到该高度
+ACTION_Z_DOWN = -36.0   # ① 下降到该高度
+ACTION_Z_UP   =   0.0   # ④ 动作结束后 Z 回升到该高度
 ACTION_WAIT_DOWN = 1.0  # ② 到位后等待 (s)
 ACTION_WAIT_MAG  = 0.5  # ③ 继电器吸合后等待 (s)
-ACTION_SPEED_RPM = 5.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
-ACTION_ID3_DELAY = 0.6   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
-ACTION_ID4_DELAY = 0.6   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
+ACTION_SPEED_RPM = 2.0   # ⑤ 动作移动转速 (rpm, 临时限速: 缓慢下降测试用)
+ACTION_ID3_DELAY = 0.5   # ④ 回升段: 电机3 (ID3) 延时旋转 (s), 在 ID2 之后动
+ACTION_ID4_DELAY = 0.5   # ④ 回升段: 电机4 (ID4) 延时旋转 (s), 在 ID3 之后动
 
 # ── trans 搬运序列参数 (相机像素坐标, px) ─────────────────────────────────
-TRANS_V_OFFSET = -400.0  # 放置点 V = 抓取点 V - 400 
-TRANS_WAIT     = 1.5     # 各步骤之间的等待时间 (s)
+TRANS_V_OFFSET = -380.0  # 放置点 V = 抓取点 V - 400 
+TRANS_WAIT     = 0.5     # 各步骤之间的等待时间 (s)
 TRANS_STEP_NUMS = ("①", "②", "③", "④", "⑤", "⑥")   # 序列步骤圈号 (最多 6 步)
 
 
@@ -264,6 +271,7 @@ class MainLogic:
         print("控制台指令: <Xmm> <Ymm> [Zmm]   (执行器中心绝对坐标, Z 缺省保持当前)")
         print("           n <u> <v> [Zmm]     (摄像头像素坐标, Z 缺省保持当前)")
         print("           home / standby     → 回到待机位置 (X=-9, Y=0, Z=80)")
+        print(f"           ready / rd         → 移动到准备位置 (执行器 X={READY_X:.0f}, Y={READY_Y:.0f}, Z={READY_Z:.0f})")
         print(f"           action / act       → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器吸合 → Z 回升到 {ACTION_Z_UP:.0f} (抓取)")
         print(f"           put                → 下降到 Z={ACTION_Z_DOWN:.0f} → 继电器释放 → Z 回升到 {ACTION_Z_UP:.0f} (放下)")
         print(f"           trans <u> <v> [角度] → 搬运: 抓取点 n <u> <v> 0 → 抓取 → 放置点 n <u> <v{TRANS_V_OFFSET:+.0f}> 0 → [舵机旋转角度] → 放下")
@@ -286,6 +294,14 @@ class MainLogic:
               f"ID3={joints[3]:+.1f}°  ID4={joints[4]:+.1f}°")
         print(f"        腕部   X={x:+.1f}  Y={y:+.1f}  Z={z:+.1f} mm")
         print(f"        执行器 X={tx:+.1f}  Y={ty:+.1f}  Z={tz:+.1f} mm")
+
+    def _run_ready(self):
+        """ready: 移动到准备位置 (执行器中心 X/Y/Z, 常量 READY_*)."""
+        print(f"── 移动至 ready 位置: 执行器 X={READY_X:+.1f}  "
+              f"Y={READY_Y:+.1f}  Z={READY_Z:+.1f} mm "
+              f"(转速 {READY_SPEED_RPM:.0f} rpm) ──")
+        self.arm.move_tool_to(READY_X, READY_Y, READY_Z,
+                              speed_rpm=READY_SPEED_RPM)
 
     def _run_action(self, mag_on=True):
         """抓取/放下序列: 当前位置 → 下降到 Z_DOWN → 等 1s → 继电器吸合/释放 → 等 0.5s → Z 回升到 0.
@@ -421,6 +437,9 @@ class MainLogic:
         if parts[0] in ("home", "standby"):
             self.arm.go_home(STANDBY_X, STANDBY_Y, STANDBY_Z,
                              speed_rpm=STANDBY_SPEED_RPM)
+            return
+        if parts[0] in ("ready", "rd"):
+            self._run_ready()
             return
         if parts[0] in ("action", "act"):
             self._run_action(mag_on=True)
